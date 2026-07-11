@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#1b2a4a">
+<title>スイング解析(プロトタイプ)</title>
+<style>
+:root{
+  --paper:#fbfbf7;
+  --grid: rgba(27,42,74,.06);
+  --grid-major: rgba(27,42,74,.12);
+  --ink:#1b2a4a;
+  --ink-soft:#5b6b85;
+  --ink-faint:#93a0b5;
+  --line:#dfe3ea;
+  --card:#ffffff;
+  --accent:#c5303a;
+  --accent-soft: rgba(197,48,58,.12);
+  --ok:#2f8557;
+  --ok-soft: rgba(62,156,105,.12);
+  --warn:#a6740f;
+  --warn-soft: rgba(214,158,46,.15);
+  --radius:14px;
+  --shadow-sm:0 1px 0 rgba(27,42,74,.04), 0 3px 8px rgba(27,42,74,.06);
+  --shadow:0 1px 0 rgba(27,42,74,.05), 0 8px 20px rgba(27,42,74,.09);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html,body{margin:0;padding:0;height:100%;}
+body{
+  font-family:"Yu Gothic","游ゴシック",YuGothic,"Hiragino Kaku Gothic ProN","Hiragino Sans",Meiryo,system-ui,sans-serif;
+  color:var(--ink);
+  background-color:var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    linear-gradient(var(--grid-major) 1.5px, transparent 1.5px),
+    linear-gradient(90deg, var(--grid-major) 1.5px, transparent 1.5px);
+  background-size:24px 24px, 24px 24px, 120px 120px, 120px 120px;
+  background-position:-1px -1px;
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+  line-height:1.5;
+  padding-bottom:env(safe-area-inset-bottom);
+}
+button{font-family:inherit;color:inherit;cursor:pointer;}
+input,select{font-family:inherit;}
+h1{font-size:1.05rem;margin:0;font-weight:800;letter-spacing:.02em;}
+h2{font-size:.92rem;margin:0 0 10px;font-weight:800;color:var(--ink);}
+
+#app{max-width:720px;margin:0 auto;padding:14px 14px 40px;}
+
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:2px 4px 12px;}
+.badge{font-size:.72rem;font-weight:700;color:var(--ink-soft);background:var(--card);border:1px solid var(--line);border-radius:99px;padding:3px 10px;}
+
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:16px;margin-bottom:14px;}
+.lead{margin:0 0 12px;font-size:.94rem;font-weight:600;}
+.hint-list{margin:0 0 14px;padding-left:1.2em;font-size:.82rem;color:var(--ink-soft);font-weight:600;}
+.hint-list li{margin-bottom:4px;}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none;border-radius:11px;padding:12px 18px;font-size:.95rem;font-weight:800;width:100%;transition:transform .12s, opacity .12s;}
+.btn:active{transform:scale(.98);}
+.btn:disabled{opacity:.4;cursor:not-allowed;}
+.btn-primary{background:var(--ink);color:#fff;box-shadow:0 4px 10px rgba(27,42,74,.28);}
+.btn-record{background:var(--accent);color:#fff;box-shadow:0 4px 10px rgba(197,48,58,.28);}
+.btn-ghost{background:var(--paper);color:var(--ink-soft);border:1.4px solid var(--line);font-weight:700;}
+.btn-sm{width:auto;padding:6px 12px;font-size:.76rem;}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap;}
+.btn-row .btn{width:auto;flex:1 1 auto;}
+.btn-icon{width:44px;flex:0 0 auto;padding:10px;font-size:1.05rem;}
+
+.error-text{margin:10px 0 0;font-size:.84rem;font-weight:700;color:var(--accent);background:var(--accent-soft);border-radius:10px;padding:10px 12px;}
+
+#stageWrap{width:100%;}
+#stage{position:relative;background:#000;border-radius:var(--radius);overflow:hidden;margin:0 auto 12px;box-shadow:var(--shadow);}
+#stage video{width:100%;height:100%;object-fit:fill;display:block;}
+#overlayCanvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+.detect-dot{position:absolute;top:10px;right:10px;width:14px;height:14px;border-radius:50%;background:rgba(255,255,255,.35);border:2px solid rgba(255,255,255,.6);transition:background .15s;}
+.detect-dot.active{background:var(--ok);border-color:#fff;}
+.elapsed-badge{position:absolute;top:10px;left:10px;font-size:.76rem;font-weight:800;color:#fff;background:rgba(0,0,0,.45);border-radius:99px;padding:4px 10px;}
+
+.scrub-wrap{margin:6px 0 14px;}
+input[type="range"]{width:100%;accent-color:var(--ink);}
+.phase-track{position:relative;height:18px;margin-top:4px;}
+.phase-pin{position:absolute;top:0;transform:translateX(-50%);width:auto;white-space:nowrap;font-size:.68rem;font-weight:800;color:#fff;background:var(--accent);border-radius:6px;padding:2px 6px;cursor:pointer;border:none;}
+.phase-pin.pin-hip{background:#3C82C6;}
+.phase-pin.pin-shoulder{background:#a6740f;}
+.phase-pin.pin-impact{background:var(--accent);}
+
+.transport{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+.speed-seg{display:flex;gap:6px;flex:1 1 auto;}
+.seg-btn{flex:1 1 auto;border:1.4px solid var(--line);background:var(--paper);border-radius:9px;padding:7px 6px;font-size:.74rem;font-weight:700;color:var(--ink-soft);}
+.seg-btn.active{background:var(--ink);border-color:var(--ink);color:#fff;}
+
+.checklist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px;}
+.check-item{border:1px solid var(--line);border-radius:11px;padding:12px;background:var(--paper);}
+.check-head{display:flex;align-items:center;gap:10px;margin-bottom:4px;}
+.check-mark{width:28px;height:28px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.9rem;color:#fff;}
+.mark-ok{background:var(--ok);}
+.mark-mid{background:var(--warn);}
+.mark-ng{background:var(--accent);}
+.mark-na{background:var(--ink-faint);}
+.check-title{font-weight:800;font-size:.9rem;flex:1 1 auto;}
+.check-detail{font-size:.8rem;color:var(--ink-soft);font-weight:600;margin:4px 0 8px;line-height:1.6;}
+.check-jumps{display:flex;gap:8px;flex-wrap:wrap;}
+
+.fine-print{font-size:.72rem;color:var(--ink-faint);font-weight:600;margin-top:12px;line-height:1.7;}
+.fine-print b{color:var(--ink-soft);}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation:none !important;transition:none !important;}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <h1>スイング解析(プロトタイプ)</h1>
+    <span class="badge" id="statusBadge">準備中</span>
+  </div>
+
+  <section id="panelStart" class="panel">
+    <p class="lead">iPhoneのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。</p>
+    <ul class="hint-list">
+      <li>撮影は<b>捕手側・打者の背後</b>から。打者の背中越しに投手方向を見る構図にしてください</li>
+      <li>打者一人が画面の大部分を占めるように。他の人が大きく写り込むと誤検出します</li>
+      <li>逆光を避け、できるだけ明るい場所で撮影してください</li>
+      <li>カメラ映像は端末の外へ送信されません(解析はすべてこのブラウザの中で行われます)</li>
+      <li>この機能はHTTPS配信のページ(またはlocalhost)でのみ動作します(file://では起動できません)</li>
+      <li>初回のみ、解析モデルの読み込みにインターネット接続が必要です</li>
+    </ul>
+    <button type="button" class="btn btn-primary" id="btnStartCamera">カメラを起動</button>
+    <p id="startError" class="error-text" hidden></p>
+  </section>
+
+  <div id="stageWrap" hidden>
+    <div id="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlayCanvas"></canvas>
+      <div class="detect-dot" id="detectDot"></div>
+      <div class="elapsed-badge" id="elapsedBadge" hidden></div>
+    </div>
+  </div>
+
+  <section id="panelLive" class="panel" hidden>
+    <p class="lead" id="liveLabel">打者と骨格線が映ったら、構えのタイミングで録画を開始してください。</p>
+    <button type="button" class="btn btn-record" id="btnRecord">録画開始</button>
+  </section>
+
+  <section id="panelResult" class="panel" hidden>
+    <div class="transport">
+      <button type="button" class="btn btn-ghost btn-icon" id="btnStepBack">◀</button>
+      <button type="button" class="btn btn-primary" id="btnPlayPause" style="flex:1 1 auto;">再生</button>
+      <button type="button" class="btn btn-ghost btn-icon" id="btnStepFwd">▶</button>
+    </div>
+    <div class="speed-seg" id="speedSeg">
+      <button type="button" class="seg-btn" data-speed="0.1">0.1x</button>
+      <button type="button" class="seg-btn" data-speed="0.25">0.25x</button>
+      <button type="button" class="seg-btn active" data-speed="0.5">0.5x</button>
+      <button type="button" class="seg-btn" data-speed="1">1x</button>
+    </div>
+    <div class="scrub-wrap">
+      <input type="range" id="scrubRange" min="0" max="1000" value="0" step="1">
+      <div class="phase-track" id="phaseTrack"></div>
+    </div>
+
+    <h2>チェックリスト(この録画からの推定・参考値)</h2>
+    <ol class="checklist" id="checklist"></ol>
+
+    <div class="btn-row" style="margin-top:14px;">
+      <button type="button" class="btn btn-ghost" id="btnReset">もう一度撮影する</button>
+    </div>
+    <p class="fine-print">
+      判定は単眼カメラの2D映像からの<b>推定値</b>です。撮影角度・明るさ・映り込みで数値は変動します。最終的な判断はご自身の目で確認してください。<br>
+      背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。<br>
+      録画は最大<span id="finePrintMaxSec"></span>秒で自動停止します。判定基準の数値はコード先頭の CONFIG に集約されています。現場の感覚に合わせて書き換えてください。
+    </p>
+  </section>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+"use strict";
+
+/* ==== 判定基準(現場の感覚に合わせて調整してください) ==== */
+var CONFIG = {
+  maxRecordSec: 6,                // 録画の自動停止までの最大秒数
+  smoothWindow: 5,                 // 角度・速度算出前の移動平均(コマ数)
+  minVisibility: 0.5,              // このスコア未満のランドマークは信頼しない
+  minValidRatio: 0.5,              // 有効コマの割合がこれ未満なら「検出精度が低い」警告
+  headWobble: { goodMax: 0.08, okMax: 0.15 },   // 肩幅に対する頭部(両耳中心)移動量の比率
+  rotationLead: { goodLeadMs: 60, okLeadMs: 0 }, // 骨盤が肩より何ms早く回り始めれば良いか
+  angularVelThresholdRatio: 0.15,  // 回転「開始」とみなす、ピーク角速度に対する比率
+  stepFallbackSec: 1/30            // コマ送りボタンの移動量(秒、再生時)
+};
+
+var LM = { nose:0, lEar:7, rEar:8, lShoulder:11, rShoulder:12, lElbow:13, rElbow:14, lWrist:15, rWrist:16, lHip:23, rHip:24, lKnee:25, rKnee:26, lAnkle:27, rAnkle:28 };
+var CONNECTIONS = [[7,8],[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+
+var el = {
+  statusBadge: document.getElementById("statusBadge"),
+  panelStart: document.getElementById("panelStart"),
+  btnStartCamera: document.getElementById("btnStartCamera"),
+  startError: document.getElementById("startError"),
+  stageWrap: document.getElementById("stageWrap"),
+  video: document.getElementById("video"),
+  canvas: document.getElementById("overlayCanvas"),
+  detectDot: document.getElementById("detectDot"),
+  elapsedBadge: document.getElementById("elapsedBadge"),
+  panelLive: document.getElementById("panelLive"),
+  btnRecord: document.getElementById("btnRecord"),
+  panelResult: document.getElementById("panelResult"),
+  btnPlayPause: document.getElementById("btnPlayPause"),
+  btnStepBack: document.getElementById("btnStepBack"),
+  btnStepFwd: document.getElementById("btnStepFwd"),
+  speedSeg: document.getElementById("speedSeg"),
+  scrubRange: document.getElementById("scrubRange"),
+  phaseTrack: document.getElementById("phaseTrack"),
+  checklist: document.getElementById("checklist"),
+  btnReset: document.getElementById("btnReset"),
+  finePrintMaxSec: document.getElementById("finePrintMaxSec")
+};
+el.finePrintMaxSec.textContent = CONFIG.maxRecordSec;
+
+var ctx = el.canvas.getContext("2d");
+var state = {
+  poseLandmarker: null,
+  mode: "idle",       // idle | live | playback
+  liveStream: null,
+  liveLandmarks: null,
+  liveBusy: false,
+  recording: false,
+  recordStartTs: 0,
+  recorder: null,
+  samples: [],        // [{t, landmarks}] (t: 秒)
+  duration: 0,
+  rafId: null,
+  transportReady: false
+};
+
+setStatus("モデル読み込み中…");
+initPoseLandmarker().then(function(pl){
+  state.poseLandmarker = pl;
+  setStatus("準備完了");
+}).catch(function(err){
+  setStatus("読み込み失敗");
+  showStartError("解析モデルの読み込みに失敗しました。インターネット接続を確認してページを再読み込みしてください。(" + (err && err.message ? err.message : err) + ")");
+});
+
+async function initPoseLandmarker(){
+  var vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  var modelUrl = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+  try{
+    return await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: modelUrl, delegate: "GPU" },
+      runningMode: "VIDEO",
+      numPoses: 1
+    });
+  }catch(e){
+    return await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: modelUrl, delegate: "CPU" },
+      runningMode: "VIDEO",
+      numPoses: 1
+    });
+  }
+}
+
+function setStatus(text){ el.statusBadge.textContent = text; }
+function showStartError(msg){ el.startError.hidden = false; el.startError.textContent = msg; }
+
+el.btnStartCamera.addEventListener("click", startCamera);
+
+async function startCamera(){
+  el.startError.hidden = true;
+  if (!state.poseLandmarker){
+    showStartError("解析モデルの読み込みが完了していません。少し待ってから再度お試しください。");
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showStartError("このブラウザ・環境ではカメラ機能が使えません。HTTPS配信のページで開いているか確認してください。");
+    return;
+  }
+  try{
+    var stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    state.liveStream = stream;
+    el.video.srcObject = stream;
+    await el.video.play();
+    el.panelStart.hidden = true;
+    el.stageWrap.hidden = false;
+    el.panelLive.hidden = false;
+    fitCanvas();
+    state.mode = "live";
+    startLiveLoop();
+  }catch(e){
+    showStartError("カメラを起動できませんでした。カメラの利用許可、HTTPS配信(またはlocalhost)であることを確認してください。(" + (e && e.message ? e.message : e) + ")");
+  }
+}
+
+function fitCanvas(){
+  var w = el.video.clientWidth || 320, h = el.video.clientHeight || 180;
+  var dpr = window.devicePixelRatio || 1;
+  el.canvas.width = w * dpr; el.canvas.height = h * dpr;
+  el.canvas.style.width = w + "px"; el.canvas.style.height = h + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", fitCanvas);
+
+/* ==== ライブ検出ループ(録画前のプレビュー中も、録画中も動く) ==== */
+function startLiveLoop(){
+  cancelAnimationFrame(state.rafId);
+  function tick(){
+    if (!state.liveBusy && state.poseLandmarker && el.video.readyState >= 2){
+      state.liveBusy = true;
+      var ts = performance.now();
+      var result = state.poseLandmarker.detectForVideo(el.video, Math.round(ts));
+      var lm = (result.landmarks && result.landmarks[0]) ? result.landmarks[0] : null;
+      state.liveLandmarks = lm;
+      el.detectDot.classList.toggle("active", !!lm);
+      if (state.recording){
+        var tSec = (ts - state.recordStartTs) / 1000;
+        state.samples.push({ t: tSec, landmarks: lm });
+        el.elapsedBadge.textContent = tSec.toFixed(1) + "s / " + CONFIG.maxRecordSec.toFixed(1) + "s";
+        if (tSec >= CONFIG.maxRecordSec) stopRecording();
+      }
+      state.liveBusy = false;
+    }
+    if (state.mode === "live") drawOverlay();
+    if (state.mode === "live") state.rafId = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+el.btnRecord.addEventListener("click", function(){
+  if (!state.recording) startRecording(); else stopRecording();
+});
+
+function startRecording(){
+  var candidates = ["video/mp4;codecs=h264", "video/mp4", "video/webm;codecs=vp8", "video/webm"];
+  var mimeType = candidates.find(function(m){ return window.MediaRecorder && MediaRecorder.isTypeSupported(m); }) || "";
+  state.recording = true;
+  state.samples = [];
+  state.recordStartTs = performance.now();
+  state.recordedChunks = [];
+  try{
+    state.recorder = mimeType ? new MediaRecorder(state.liveStream, { mimeType: mimeType }) : new MediaRecorder(state.liveStream);
+  }catch(e){
+    state.recorder = new MediaRecorder(state.liveStream);
+  }
+  state.recorder.ondataavailable = function(e){ if (e.data.size) state.recordedChunks.push(e.data); };
+  state.recorder.onstop = onRecordingFinished;
+  state.recorder.start();
+  el.btnRecord.textContent = "停止";
+  el.elapsedBadge.hidden = false;
+}
+
+function stopRecording(){
+  if (!state.recording) return;
+  state.recording = false;
+  state.recorder.stop();
+  el.btnRecord.textContent = "録画開始";
+}
+
+function onRecordingFinished(){
+  if (state.liveStream){ state.liveStream.getTracks().forEach(function(tr){ tr.stop(); }); }
+  cancelAnimationFrame(state.rafId);
+  state.mode = "playback";
+  el.panelLive.hidden = true;
+  el.elapsedBadge.hidden = true;
+  el.detectDot.classList.remove("active");
+
+  var blob = new Blob(state.recordedChunks, { type: state.recorder.mimeType || "video/webm" });
+  el.video.srcObject = null;
+  var url = URL.createObjectURL(blob);
+  el.video.src = url;
+  el.video.addEventListener("loadedmetadata", function onMeta(){
+    el.video.removeEventListener("loadedmetadata", onMeta);
+    state.duration = el.video.duration;
+    fitCanvas();
+    el.panelResult.hidden = false;
+    setupTransport();
+    finishAnalysis();
+  }, { once: true });
+}
+
+function visOK(lm){ return !!lm && (lm.visibility === undefined || lm.visibility >= CONFIG.minVisibility); }
+function dist(a, b){ var dx = a.x - b.x, dy = a.y - b.y; return Math.sqrt(dx*dx + dy*dy); }
+function angleDeg(a, b){ return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }
+function angleDiffDeg(a, b){
+  var d = b - a;
+  while (d > 180) d -= 360;
+  while (d < -180) d += 360;
+  return d;
+}
+
+function interpolateNulls(arr){
+  var out = arr.slice();
+  var n = out.length;
+  var lastIdx = -1;
+  for (var i = 0; i < n; i++){
+    if (out[i] != null){
+      if (lastIdx >= 0 && i - lastIdx > 1){
+        var a = out[lastIdx], b = out[i];
+        for (var k = lastIdx + 1; k < i; k++){
+          var f = (k - lastIdx) / (i - lastIdx);
+          out[k] = a + (b - a) * f;
+        }
+      }
+      lastIdx = i;
+    }
+  }
+  var firstVal = out.find(function(v){ return v != null; });
+  var lastVal = null;
+  for (i = n - 1; i >= 0; i--){ if (out[i] != null){ lastVal = out[i]; break; } }
+  for (i = 0; i < n; i++){ if (out[i] == null) out[i] = (i === 0 ? firstVal : out[i-1]); }
+  return out;
+}
+
+function movingAverage(arr, win){
+  var n = arr.length, out = new Array(n);
+  var half = Math.floor(win / 2);
+  for (var i = 0; i < n; i++){
+    var lo = Math.max(0, i - half), hi = Math.min(n - 1, i + half);
+    var sum = 0, cnt = 0;
+    for (var k = lo; k <= hi; k++){ sum += arr[k]; cnt++; }
+    out[i] = sum / cnt;
+  }
+  return out;
+}
+
+function buildSeries(samples){
+  var n = samples.length;
+  var shoulderAngle = new Array(n).fill(null);
+  var hipAngle = new Array(n).fill(null);
+  var headX = new Array(n).fill(null), headY = new Array(n).fill(null);
+  var wristX = new Array(n).fill(null), wristY = new Array(n).fill(null);
+  var shoulderWidth = new Array(n).fill(null);
+  var validCount = 0;
+  for (var i = 0; i < n; i++){
+    var lm = samples[i].landmarks;
+    if (!lm) continue;
+    validCount++;
+    var ls = lm[LM.lShoulder], rs = lm[LM.rShoulder], lh = lm[LM.lHip], rh = lm[LM.rHip];
+    var le = lm[LM.lEar], re = lm[LM.rEar], lw = lm[LM.lWrist], rw = lm[LM.rWrist];
+    if (visOK(ls) && visOK(rs)){ shoulderAngle[i] = angleDeg(ls, rs); shoulderWidth[i] = dist(ls, rs); }
+    if (visOK(lh) && visOK(rh)){ hipAngle[i] = angleDeg(lh, rh); }
+    // 背面からの撮影のため顔(鼻)は写らない前提。両耳の中心を頭部位置の代わりに使う
+    if (visOK(le) && visOK(re)){ headX[i] = (le.x + re.x) / 2; headY[i] = (le.y + re.y) / 2; }
+    else if (visOK(le)){ headX[i] = le.x; headY[i] = le.y; }
+    else if (visOK(re)){ headX[i] = re.x; headY[i] = re.y; }
+    if (visOK(lw) && visOK(rw)){ wristX[i] = (lw.x + rw.x) / 2; wristY[i] = (lw.y + rw.y) / 2; }
+    else if (visOK(lw)){ wristX[i] = lw.x; wristY[i] = lw.y; }
+    else if (visOK(rw)){ wristX[i] = rw.x; wristY[i] = rw.y; }
+  }
+  return { shoulderAngle: shoulderAngle, hipAngle: hipAngle, headX: headX, headY: headY, wristX: wristX, wristY: wristY, shoulderWidth: shoulderWidth, validRatio: n ? validCount / n : 0 };
+}
+
+function angularVelSeries(angleArr, ts){
+  var n = angleArr.length, out = new Array(n).fill(0);
+  for (var i = 1; i < n; i++){
+    var dt = ts[i] - ts[i-1];
+    if (dt <= 0){ out[i] = out[i-1]; continue; }
+    out[i] = Math.abs(angleDiffDeg(angleArr[i-1], angleArr[i])) / dt;
+  }
+  out[0] = out[1] || 0;
+  return out;
+}
+
+function speedSeries(xs, ys, ts){
+  var n = xs.length, out = new Array(n).fill(0);
+  for (var i = 1; i < n; i++){
+    var dt = ts[i] - ts[i-1];
+    if (dt <= 0){ out[i] = out[i-1]; continue; }
+    var dx = xs[i] - xs[i-1], dy = ys[i] - ys[i-1];
+    out[i] = Math.sqrt(dx*dx + dy*dy) / dt;
+  }
+  out[0] = out[1] || 0;
+  return out;
+}
+
+function argmax(arr, lo, hi){
+  var bi = lo, bv = -Infinity;
+  for (var i = lo; i <= hi; i++){ if (arr[i] > bv){ bv = arr[i]; bi = i; } }
+  return bi;
+}
+
+// ピーク(インパクト等)の手前を遡り、角速度がピークの一定割合を下回る地点を「回転開始」とみなす
+function findRotationStart(angVel, peakIdx){
+  var maxV = 0;
+  for (var i = 0; i <= peakIdx; i++){ if (angVel[i] > maxV) maxV = angVel[i]; }
+  var thresh = maxV * CONFIG.angularVelThresholdRatio;
+  for (var i = peakIdx; i >= 0; i--){
+    if (angVel[i] < thresh) return Math.min(i + 1, peakIdx);
+  }
+  return 0;
+}
+
+function finishAnalysis(){
+  var samples = state.samples;
+  if (samples.length < 4){
+    el.checklist.innerHTML = "";
+    var tooShort = document.createElement("li");
+    tooShort.className = "check-item";
+    tooShort.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">録画が短すぎます</div></div><p class="check-detail">解析に十分なコマ数がありませんでした。録画開始から数秒間、続けて撮影してください。</p>';
+    el.checklist.appendChild(tooShort);
+    return;
+  }
+  var ts = samples.map(function(s){ return s.t; });
+  var series = buildSeries(samples);
+
+  if (series.validRatio < CONFIG.minValidRatio){
+    el.checklist.innerHTML = "";
+    var warn = document.createElement("li");
+    warn.className = "check-item";
+    warn.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">検出精度が低いです</div></div><p class="check-detail">この録画では体全体を十分に検出できませんでした(有効コマ率 ' + Math.round(series.validRatio*100) + '%)。撮影距離・明るさ・映り込みを見直して再度お試しください。</p>';
+    el.checklist.appendChild(warn);
+    return;
+  }
+
+  var headX = interpolateNulls(series.headX), headY = interpolateNulls(series.headY);
+  var shoulderAngle = interpolateNulls(series.shoulderAngle);
+  var hipAngle = interpolateNulls(series.hipAngle);
+  var wristX = interpolateNulls(series.wristX), wristY = interpolateNulls(series.wristY);
+  var shoulderWidth = interpolateNulls(series.shoulderWidth);
+
+  headX = movingAverage(headX, CONFIG.smoothWindow);
+  headY = movingAverage(headY, CONFIG.smoothWindow);
+  shoulderAngle = movingAverage(shoulderAngle, CONFIG.smoothWindow);
+  hipAngle = movingAverage(hipAngle, CONFIG.smoothWindow);
+  wristX = movingAverage(wristX, CONFIG.smoothWindow);
+  wristY = movingAverage(wristY, CONFIG.smoothWindow);
+
+  var wristSpeed = speedSeries(wristX, wristY, ts);
+  var hipAngVel = angularVelSeries(hipAngle, ts);
+  var shoulderAngVel = angularVelSeries(shoulderAngle, ts);
+
+  var n = samples.length;
+  var impactIdx = argmax(wristSpeed, Math.floor(n * 0.15), n - 1);
+  var hipStartIdx = findRotationStart(hipAngVel, impactIdx);
+  var shoulderStartIdx = findRotationStart(shoulderAngVel, impactIdx);
+  var rotationStartIdx = Math.min(hipStartIdx, shoulderStartIdx);
+
+  var refShoulderWidth = shoulderWidth[0] || shoulderWidth.find(function(v){ return v > 0; }) || 1;
+  var headDisp = dist(
+    { x: headX[rotationStartIdx], y: headY[rotationStartIdx] },
+    { x: headX[impactIdx], y: headY[impactIdx] }
+  );
+  var wobbleRatio = headDisp / refShoulderWidth;
+
+  var leadMs = (ts[shoulderStartIdx] - ts[hipStartIdx]) * 1000;
+  var swingMs = (ts[impactIdx] - ts[rotationStartIdx]) * 1000;
+
+  renderPhaseTrack([
+    { t: ts[hipStartIdx], label: "骨盤始動", cls: "pin-hip" },
+    { t: ts[shoulderStartIdx], label: "肩始動", cls: "pin-shoulder" },
+    { t: ts[impactIdx], label: "インパクト", cls: "pin-impact" }
+  ]);
+
+  renderChecklist([
+    {
+      title: "頭の水平・上下のブレ(両耳の中心)",
+      verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
+      detail: "回転開始からインパクトまでの頭部(両耳の中心)の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)",
+      jumps: [
+        { label: "回転開始を見る", t: ts[rotationStartIdx] },
+        { label: "インパクトを見る", t: ts[impactIdx] }
+      ]
+    },
+    {
+      title: "回転の順序(骨盤が肩より先行しているか)",
+      verdict: leadMs >= CONFIG.rotationLead.goodLeadMs ? "ok" : (leadMs >= CONFIG.rotationLead.okLeadMs ? "mid" : "ng"),
+      detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)",
+      jumps: [
+        { label: "骨盤の始動を見る", t: ts[hipStartIdx] },
+        { label: "肩の始動を見る", t: ts[shoulderStartIdx] }
+      ]
+    },
+    {
+      title: "始動〜インパクトの所要時間(参考値)",
+      verdict: "na",
+      detail: "回転開始からインパクトまで約 " + Math.round(swingMs) + "ms でした。一般に上級者は120〜180ms程度とされますが、レベルやスイングタイプで幅があるため、あくまで参考値としてご覧ください。",
+      jumps: [
+        { label: "回転開始を見る", t: ts[rotationStartIdx] },
+        { label: "インパクトを見る", t: ts[impactIdx] }
+      ]
+    }
+  ]);
+}
+
+function renderPhaseTrack(pins){
+  el.phaseTrack.innerHTML = "";
+  var duration = state.duration || 1;
+  pins.forEach(function(p){
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "phase-pin " + p.cls;
+    btn.textContent = p.label;
+    var pct = Math.max(0, Math.min(100, (p.t / duration) * 100));
+    btn.style.left = pct + "%";
+    btn.addEventListener("click", function(){ seekAndPause(p.t); });
+    el.phaseTrack.appendChild(btn);
+  });
+}
+
+var MARK_CLASS = { ok: "mark-ok", mid: "mark-mid", ng: "mark-ng", na: "mark-na" };
+var MARK_TEXT = { ok: "○", mid: "△", ng: "×", na: "―" };
+
+function renderChecklist(items){
+  el.checklist.innerHTML = "";
+  items.forEach(function(item){
+    var li = document.createElement("li");
+    li.className = "check-item";
+    var head = document.createElement("div");
+    head.className = "check-head";
+    var mark = document.createElement("div");
+    mark.className = "check-mark " + MARK_CLASS[item.verdict];
+    mark.textContent = MARK_TEXT[item.verdict];
+    var title = document.createElement("div");
+    title.className = "check-title";
+    title.textContent = item.title;
+    head.appendChild(mark); head.appendChild(title);
+    var detail = document.createElement("p");
+    detail.className = "check-detail";
+    detail.textContent = item.detail;
+    var jumps = document.createElement("div");
+    jumps.className = "check-jumps";
+    item.jumps.forEach(function(j){
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn btn-ghost btn-sm";
+      b.textContent = j.label;
+      b.addEventListener("click", function(){ seekAndPause(j.t); });
+      jumps.appendChild(b);
+    });
+    li.appendChild(head); li.appendChild(detail); li.appendChild(jumps);
+    el.checklist.appendChild(li);
+  });
+}
+
+function seekAndPause(t){
+  el.video.pause();
+  el.video.currentTime = Math.max(0, Math.min(state.duration, t));
+  updatePlayPauseLabel();
+}
+
+/* ==== 再生コントロール(録画済みクリップの確認用。一度だけ配線する) ==== */
+function setupTransport(){
+  if (state.transportReady) return;
+  state.transportReady = true;
+
+  el.btnPlayPause.addEventListener("click", function(){
+    if (el.video.paused) el.video.play(); else el.video.pause();
+    updatePlayPauseLabel();
+  });
+  el.video.addEventListener("play", updatePlayPauseLabel);
+  el.video.addEventListener("pause", updatePlayPauseLabel);
+  el.video.addEventListener("play", startPlaybackOverlayLoop);
+
+  el.btnStepBack.addEventListener("click", function(){
+    el.video.pause();
+    el.video.currentTime = Math.max(0, el.video.currentTime - CONFIG.stepFallbackSec);
+    updatePlayPauseLabel();
+  });
+  el.btnStepFwd.addEventListener("click", function(){
+    el.video.pause();
+    el.video.currentTime = Math.min(state.duration, el.video.currentTime + CONFIG.stepFallbackSec);
+    updatePlayPauseLabel();
+  });
+
+  el.speedSeg.querySelectorAll(".seg-btn").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      el.speedSeg.querySelectorAll(".seg-btn").forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+      el.video.playbackRate = parseFloat(btn.dataset.speed);
+    });
+  });
+  el.video.playbackRate = 0.5;
+
+  el.scrubRange.addEventListener("input", function(){
+    var pct = parseInt(el.scrubRange.value, 10) / 1000;
+    el.video.pause();
+    el.video.currentTime = pct * state.duration;
+    updatePlayPauseLabel();
+    drawOverlay();
+  });
+  el.video.addEventListener("timeupdate", function(){
+    if (state.mode === "playback" && state.duration > 0){
+      el.scrubRange.value = Math.round((el.video.currentTime / state.duration) * 1000);
+    }
+  });
+
+  el.btnReset.addEventListener("click", resetApp);
+  el.video.addEventListener("seeked", function(){ if (state.mode === "playback") drawOverlay(); });
+  updatePlayPauseLabel();
+}
+
+function updatePlayPauseLabel(){
+  el.btnPlayPause.textContent = el.video.paused ? "再生" : "一時停止";
+}
+
+function startPlaybackOverlayLoop(){
+  cancelAnimationFrame(state.rafId);
+  function loop(){
+    drawOverlay();
+    if (!el.video.paused && !el.video.ended){
+      state.rafId = requestAnimationFrame(loop);
+    }
+  }
+  loop();
+}
+
+function resetApp(){
+  cancelAnimationFrame(state.rafId);
+  if (state.liveStream){ state.liveStream.getTracks().forEach(function(tr){ tr.stop(); }); state.liveStream = null; }
+  el.video.pause();
+  el.video.removeAttribute("src");
+  el.video.srcObject = null;
+  el.video.load();
+  el.panelResult.hidden = true;
+  el.panelLive.hidden = true;
+  el.stageWrap.hidden = true;
+  el.panelStart.hidden = false;
+  el.startError.hidden = true;
+  el.btnRecord.textContent = "録画開始";
+  state.mode = "idle";
+  state.samples = []; state.duration = 0; state.recording = false;
+}
+
+/* ==== 骨格オーバーレイ描画 ==== */
+function nearestSampleIndex(t){
+  var samples = state.samples;
+  var lo = 0, hi = samples.length - 1;
+  if (t <= samples[0].t) return 0;
+  if (t >= samples[hi].t) return hi;
+  while (lo < hi){
+    var mid = (lo + hi) >> 1;
+    if (samples[mid].t < t) lo = mid + 1; else hi = mid;
+  }
+  var a = Math.max(0, lo - 1), b = lo;
+  return (Math.abs(samples[a].t - t) <= Math.abs(samples[b].t - t)) ? a : b;
+}
+
+function drawOverlay(){
+  var w = el.canvas.clientWidth, h = el.canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  var lm = null;
+  if (state.mode === "live"){
+    lm = state.liveLandmarks;
+  } else if (state.mode === "playback" && state.samples.length){
+    var idx = nearestSampleIndex(el.video.currentTime);
+    lm = state.samples[idx].landmarks;
+  }
+  if (!lm) return;
+
+  ctx.strokeStyle = "#c5303a";
+  ctx.lineWidth = 3;
+  CONNECTIONS.forEach(function(pair){
+    var a = lm[pair[0]], b = lm[pair[1]];
+    if (!visOK(a) || !visOK(b)) return;
+    ctx.beginPath();
+    ctx.moveTo(a.x * w, a.y * h);
+    ctx.lineTo(b.x * w, b.y * h);
+    ctx.stroke();
+  });
+  ctx.fillStyle = "#fbfbf7";
+  Object.keys(LM).forEach(function(key){
+    var p = lm[LM[key]];
+    if (!visOK(p)) return;
+    ctx.beginPath();
+    ctx.arc(p.x * w, p.y * h, 4, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+</script>
+</body>
+</html>

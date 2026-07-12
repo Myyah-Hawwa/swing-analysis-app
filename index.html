@@ -71,6 +71,10 @@ h2{font-size:.92rem;margin:0 0 10px;font-weight:800;color:var(--ink);}
 
 .error-text{margin:10px 0 0;font-size:.84rem;font-weight:700;color:var(--accent);background:var(--accent-soft);border-radius:10px;padding:10px 12px;}
 
+.field-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
+.field-row label{font-size:.82rem;font-weight:700;color:var(--ink-soft);}
+.field-row input[type="number"]{width:6.5em;padding:8px 10px;border:1.4px solid var(--line);border-radius:9px;font-size:.95rem;font-weight:700;color:var(--ink);}
+
 #stageWrap{width:100%;}
 #stage{position:relative;background:#000;border-radius:var(--radius);overflow:hidden;margin:0 auto 12px;box-shadow:var(--shadow);}
 #stage video{width:100%;height:100%;object-fit:fill;display:block;}
@@ -129,6 +133,10 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
       <li>この機能はHTTPS配信のページ(またはlocalhost)でのみ動作します(file://では起動できません)</li>
       <li>初回のみ、解析モデルの読み込みにインターネット接続が必要です</li>
     </ul>
+    <div class="field-row">
+      <label for="shoulderWidthInput">打者の肩幅(cm、目安でよい)</label>
+      <input type="number" id="shoulderWidthInput" value="38" min="15" max="60" step="1">
+    </div>
     <button type="button" class="btn btn-primary" id="btnStartCamera">カメラを起動</button>
     <p id="startError" class="error-text" hidden></p>
   </section>
@@ -174,6 +182,7 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
     <p class="fine-print">
       判定は単眼カメラの2D映像からの<b>推定値</b>です。撮影角度・明るさ・映り込みで数値は変動します。最終的な判断はご自身の目で確認してください。<br>
       背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。<br>
+      スピードは手首の動きから推定した<b>手元の速さ</b>であり、バットは検出していません。バット先端の実速度とは異なります。入力した肩幅を基準に換算するため、肩幅の入力値の正確さが推定精度に直結します。<br>
       録画は最大<span id="finePrintMaxSec"></span>秒で自動停止します。判定基準の数値はコード先頭の CONFIG に集約されています。現場の感覚に合わせて書き換えてください。
     </p>
   </section>
@@ -193,7 +202,8 @@ var CONFIG = {
   headWobble: { goodMax: 0.08, okMax: 0.15 },   // 肩幅に対する頭部(両耳中心)移動量の比率
   rotationLead: { goodLeadMs: 60, okLeadMs: 0 }, // 骨盤が肩より何ms早く回り始めれば良いか
   angularVelThresholdRatio: 0.15,  // 回転「開始」とみなす、ピーク角速度に対する比率
-  stepFallbackSec: 1/30            // コマ送りボタンの移動量(秒、再生時)
+  stepFallbackSec: 1/30,           // コマ送りボタンの移動量(秒、再生時)
+  speedSanity: { minKmh: 5, maxKmh: 90 } // 手元(グリップ)速度の妥当範囲。バット先端速度ではない点に注意。外れたら信頼せず「不明」扱いにする
 };
 
 var LM = { nose:0, lEar:7, rEar:8, lShoulder:11, rShoulder:12, lElbow:13, rElbow:14, lWrist:15, rWrist:16, lHip:23, rHip:24, lKnee:25, rKnee:26, lAnkle:27, rAnkle:28 };
@@ -203,6 +213,7 @@ var el = {
   statusBadge: document.getElementById("statusBadge"),
   panelStart: document.getElementById("panelStart"),
   btnStartCamera: document.getElementById("btnStartCamera"),
+  shoulderWidthInput: document.getElementById("shoulderWidthInput"),
   startError: document.getElementById("startError"),
   stageWrap: document.getElementById("stageWrap"),
   video: document.getElementById("video"),
@@ -238,6 +249,7 @@ var state = {
   recorder: null,
   recordingGen: 0,     // 録画セッションの世代。古い録画のonstop/onerrorが新しい録画を汚染しないためのガード
   currentVideoUrl: null, // 再生用Blob URL(撮り直し時にrevokeするため保持)
+  shoulderWidthCm: 38, // カメラ起動時点の入力値をスナップショット(録画中に入力欄が変わっても解析には影響させない)
   samples: [],        // [{t, landmarks}] (t: 秒)
   duration: 0,
   rafId: null,
@@ -308,6 +320,9 @@ async function startCamera(){
     });
     state.liveStream = stream;
     el.liveError.hidden = true;
+    var swInput = parseFloat(el.shoulderWidthInput.value);
+    if (!(swInput > 0)) swInput = 38;
+    state.shoulderWidthCm = Math.max(15, Math.min(60, swInput)); // 録画開始時点の値をスナップショット
     var track = stream.getVideoTracks()[0];
     if (track){
       track.addEventListener("ended", function(){
@@ -505,7 +520,10 @@ function showRecordingProblem(msg){
 }
 
 function visOK(lm){ return !!lm && (lm.visibility === undefined || lm.visibility >= CONFIG.minVisibility); }
-function dist(a, b){ var dx = a.x - b.x, dy = a.y - b.y; return Math.sqrt(dx*dx + dy*dy); }
+// ランドマークのx/yはそれぞれ画像の幅・高さで正規化されており、フレームが正方形でない限り
+// 正規化x単位1と正規化y単位1は異なる物理距離に対応する。yScale(videoHeight/videoWidth)を掛けて
+// 「正規化x単位」に揃えてから合成することで、非正方形フレーム(例: 1280x720)での歪みを補正する。
+function dist(a, b, yScale){ var dx = a.x - b.x, dy = (a.y - b.y) * (yScale || 1); return Math.sqrt(dx*dx + dy*dy); }
 function angleDeg(a, b){ return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }
 function angleDiffDeg(a, b){
   var d = b - a;
@@ -550,6 +568,12 @@ function movingAverage(arr, win){
 }
 
 function allNull(arr){ return arr.every(function(v){ return v == null; }); }
+function median(arr){
+  if (!arr.length) return null;
+  var sorted = arr.slice().sort(function(a, b){ return a - b; });
+  var mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid-1] + sorted[mid]) / 2;
+}
 
 // 角度(度)は±180°でラップアラウンドするため、通常のinterpolateNulls/movingAverageをそのまま使うと
 // 179°⇔-179°付近をまたぐ区間で実体と異なる値になる。単位円上(cos/sin)で補間・平滑化してから角度に戻す。
@@ -567,7 +591,7 @@ function smoothAngle(arr, win){
   return cosA.map(function(c, i){ return Math.atan2(sinA[i], c) * 180 / Math.PI; });
 }
 
-function buildSeries(samples){
+function buildSeries(samples, yScale){
   var n = samples.length;
   var shoulderAngle = new Array(n).fill(null);
   var hipAngle = new Array(n).fill(null);
@@ -581,7 +605,7 @@ function buildSeries(samples){
     validCount++;
     var ls = lm[LM.lShoulder], rs = lm[LM.rShoulder], lh = lm[LM.lHip], rh = lm[LM.rHip];
     var le = lm[LM.lEar], re = lm[LM.rEar], lw = lm[LM.lWrist], rw = lm[LM.rWrist];
-    if (visOK(ls) && visOK(rs)){ shoulderAngle[i] = angleDeg(ls, rs); shoulderWidth[i] = dist(ls, rs); }
+    if (visOK(ls) && visOK(rs)){ shoulderAngle[i] = angleDeg(ls, rs); shoulderWidth[i] = dist(ls, rs, yScale); }
     if (visOK(lh) && visOK(rh)){ hipAngle[i] = angleDeg(lh, rh); }
     // 背面からの撮影のため顔(鼻)は写らない前提。両耳の中心を頭部位置の代わりに使う
     if (visOK(le) && visOK(re)){ headX[i] = (le.x + re.x) / 2; headY[i] = (le.y + re.y) / 2; }
@@ -605,12 +629,12 @@ function angularVelSeries(angleArr, ts){
   return out;
 }
 
-function speedSeries(xs, ys, ts){
+function speedSeries(xs, ys, ts, yScale){
   var n = xs.length, out = new Array(n).fill(0);
   for (var i = 1; i < n; i++){
     var dt = ts[i] - ts[i-1];
     if (dt <= 0){ out[i] = out[i-1]; continue; }
-    var dx = xs[i] - xs[i-1], dy = ys[i] - ys[i-1];
+    var dx = xs[i] - xs[i-1], dy = (ys[i] - ys[i-1]) * (yScale || 1);
     out[i] = Math.sqrt(dx*dx + dy*dy) / dt;
   }
   out[0] = out[1] || 0;
@@ -646,7 +670,10 @@ function finishAnalysis(){
     return;
   }
   var ts = samples.map(function(s){ return s.t; });
-  var series = buildSeries(samples);
+  // ランドマークのx/yはフレーム幅・高さそれぞれで正規化されているため、正方形でないフレーム(既定1280x720)では
+  // xとyを単純に合成すると歪む。yをこの係数で補正してから使うことで「正規化x単位」に揃える。
+  var aspectCorrection = (el.video.videoWidth && el.video.videoHeight) ? (el.video.videoHeight / el.video.videoWidth) : 1;
+  var series = buildSeries(samples, aspectCorrection);
 
   if (series.validRatio < CONFIG.minValidRatio){
     el.checklist.innerHTML = "";
@@ -682,7 +709,7 @@ function finishAnalysis(){
 
   var wristX = movingAverage(interpolateNulls(series.wristX), CONFIG.smoothWindow);
   var wristY = movingAverage(interpolateNulls(series.wristY), CONFIG.smoothWindow);
-  var wristSpeed = speedSeries(wristX, wristY, ts);
+  var wristSpeed = speedSeries(wristX, wristY, ts, aspectCorrection);
   var impactIdx = argmax(wristSpeed, Math.floor(n * 0.15), n - 1);
 
   var hipStartIdx = null, shoulderStartIdx = null;
@@ -697,13 +724,24 @@ function finishAnalysis(){
   var rotationStartIdx = !hipMissing && !shoulderMissing ? Math.min(hipStartIdx, shoulderStartIdx)
     : (!hipMissing ? hipStartIdx : shoulderStartIdx);
 
+  // 肩幅(cm入力)を基準に、正規化座標→実距離のおおまかな換算スケールを作る(頭部ブレ・手元スピード推定の両方で使う)。
+  // 体が回転すると肩幅の見かけの投影長が縮むため、回転開始より前(構えに近い区間)の複数コマの中央値を基準にする。
+  var shoulderWidthSeries = allNull(series.shoulderWidth) ? null : interpolateNulls(series.shoulderWidth);
+  var refShoulderWidthNorm = null;
+  if (shoulderWidthSeries){
+    var addressWidths = shoulderWidthSeries.slice(0, rotationStartIdx + 1).filter(function(v){ return v > 0; });
+    refShoulderWidthNorm = addressWidths.length ? median(addressWidths) : null;
+  }
+  var userShoulderWidthCm = state.shoulderWidthCm;
+  var cmPerNormUnit = refShoulderWidthNorm ? (userShoulderWidthCm / refShoulderWidthNorm) : null;
+
   // インパクトが回転開始と同一コマ以前(検出ノイズ・極端に短い録画)の場合、所要時間・頭部ブレは自己参照の0になり信頼できない
   var swingMs = (ts[impactIdx] - ts[rotationStartIdx]) * 1000;
   var timingReliable = impactIdx > rotationStartIdx && swingMs >= 20;
 
   var checklistItems = [];
 
-  if (allNull(series.headX) || allNull(series.shoulderWidth)){
+  if (allNull(series.headX) || !refShoulderWidthNorm){
     checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: "na",
@@ -720,13 +758,12 @@ function finishAnalysis(){
   } else {
     var headX = movingAverage(interpolateNulls(series.headX), CONFIG.smoothWindow);
     var headY = movingAverage(interpolateNulls(series.headY), CONFIG.smoothWindow);
-    var shoulderWidth = interpolateNulls(series.shoulderWidth);
-    var refShoulderWidth = shoulderWidth.find(function(v){ return v > 0; }) || null;
     var headDisp = dist(
       { x: headX[rotationStartIdx], y: headY[rotationStartIdx] },
-      { x: headX[impactIdx], y: headY[impactIdx] }
+      { x: headX[impactIdx], y: headY[impactIdx] },
+      aspectCorrection
     );
-    var wobbleRatio = headDisp / refShoulderWidth;
+    var wobbleRatio = headDisp / refShoulderWidthNorm;
     checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
@@ -775,6 +812,34 @@ function finishAnalysis(){
         { label: "インパクトを見る", t: ts[impactIdx] }
       ]
     });
+  }
+
+  // 手元(グリップ)の最大スピード推定。バット先端は手元より速く動く(てこの原理)ため、
+  // ここで出る数値はバットスピードそのものではなく、それより控えめな「手元の速さ」の推定値であることに注意。
+  if (!cmPerNormUnit){
+    checklistItems.push({
+      title: "手元の最大スピード(推定)",
+      verdict: "na",
+      detail: "肩幅による換算ができなかったため、スピードは推定できませんでした。",
+      jumps: []
+    });
+  } else {
+    var speedKmh = wristSpeed[impactIdx] * cmPerNormUnit * 0.036; // cm/s → km/h
+    if (!isFinite(speedKmh) || speedKmh < CONFIG.speedSanity.minKmh || speedKmh > CONFIG.speedSanity.maxKmh){
+      checklistItems.push({
+        title: "手元の最大スピード(推定)",
+        verdict: "na",
+        detail: "推定値が現実的な範囲を超えたため、信頼できる数値を出せませんでした。肩幅の入力値やカメラ距離・映り込みを確認し、再度お試しください。",
+        jumps: [ { label: "インパクトを見る", t: ts[impactIdx] } ]
+      });
+    } else {
+      checklistItems.push({
+        title: "手元の最大スピード(推定)",
+        verdict: "na",
+        detail: "インパクト付近での手元(グリップ)の最大速度は約 " + Math.round(speedKmh) + "km/h と推定されました。バット先端の速度はてこの原理でこれより速くなるため、バットスピードそのものではない点にご注意ください。入力した肩幅(" + userShoulderWidthCm + "cm)を基準にした概算値です。",
+        jumps: [ { label: "インパクトを見る", t: ts[impactIdx] } ]
+      });
+    }
   }
 
   var pins = [{ t: ts[impactIdx], label: "インパクト", cls: "pin-impact" }];

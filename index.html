@@ -145,6 +145,7 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
   <section id="panelLive" class="panel" hidden>
     <p class="lead" id="liveLabel">打者と骨格線が映ったら、構えのタイミングで録画を開始してください。</p>
     <button type="button" class="btn btn-record" id="btnRecord">録画開始</button>
+    <p id="liveError" class="error-text" hidden></p>
   </section>
 
   <section id="panelResult" class="panel" hidden>
@@ -210,6 +211,7 @@ var el = {
   elapsedBadge: document.getElementById("elapsedBadge"),
   panelLive: document.getElementById("panelLive"),
   btnRecord: document.getElementById("btnRecord"),
+  liveError: document.getElementById("liveError"),
   panelResult: document.getElementById("panelResult"),
   btnPlayPause: document.getElementById("btnPlayPause"),
   btnStepBack: document.getElementById("btnStepBack"),
@@ -230,14 +232,25 @@ var state = {
   liveStream: null,
   liveLandmarks: null,
   liveBusy: false,
+  startingCamera: false,
   recording: false,
   recordStartTs: 0,
   recorder: null,
+  recordingGen: 0,     // 録画セッションの世代。古い録画のonstop/onerrorが新しい録画を汚染しないためのガード
+  currentVideoUrl: null, // 再生用Blob URL(撮り直し時にrevokeするため保持)
   samples: [],        // [{t, landmarks}] (t: 秒)
   duration: 0,
   rafId: null,
   transportReady: false
 };
+
+// 録画中・プレビュー中にタブがバックグラウンド化したら、気づかないまま録画が続くのを防ぐため録画を打ち切る
+document.addEventListener("visibilitychange", function(){
+  if (document.hidden && state.mode === "live" && state.recording){
+    stopRecording();
+    showLiveError("バックグラウンドに移行したため録画を停止しました。もう一度録画してください。");
+  }
+});
 
 setStatus("モデル読み込み中…");
 initPoseLandmarker().then(function(pl){
@@ -270,11 +283,14 @@ async function initPoseLandmarker(){
 
 function setStatus(text){ el.statusBadge.textContent = text; }
 function showStartError(msg){ el.startError.hidden = false; el.startError.textContent = msg; }
+function showLiveError(msg){ el.liveError.hidden = false; el.liveError.textContent = msg; }
 
 el.btnStartCamera.addEventListener("click", startCamera);
+window.__appBooted = true; // モジュール読み込み失敗検知用(下部の非モジュールscriptから参照)
 
 async function startCamera(){
   el.startError.hidden = true;
+  if (state.startingCamera) return; // 連打によるgetUserMedia多重起動・ストリームリークを防ぐ
   if (!state.poseLandmarker){
     showStartError("解析モデルの読み込みが完了していません。少し待ってから再度お試しください。");
     return;
@@ -283,12 +299,23 @@ async function startCamera(){
     showStartError("このブラウザ・環境ではカメラ機能が使えません。HTTPS配信のページで開いているか確認してください。");
     return;
   }
+  state.startingCamera = true;
+  el.btnStartCamera.disabled = true;
   try{
     var stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: false
     });
     state.liveStream = stream;
+    el.liveError.hidden = true;
+    var track = stream.getVideoTracks()[0];
+    if (track){
+      track.addEventListener("ended", function(){
+        if (state.mode !== "live") return;
+        showLiveError("カメラ映像が失われました。もう一度カメラを起動してください。");
+        if (state.recording) stopRecording();
+      });
+    }
     el.video.srcObject = stream;
     await el.video.play();
     el.panelStart.hidden = true;
@@ -299,6 +326,9 @@ async function startCamera(){
     startLiveLoop();
   }catch(e){
     showStartError("カメラを起動できませんでした。カメラの利用許可、HTTPS配信(またはlocalhost)であることを確認してください。(" + (e && e.message ? e.message : e) + ")");
+  }finally{
+    state.startingCamera = false;
+    el.btnStartCamera.disabled = false;
   }
 }
 
@@ -317,21 +347,30 @@ function startLiveLoop(){
   function tick(){
     if (!state.liveBusy && state.poseLandmarker && el.video.readyState >= 2){
       state.liveBusy = true;
-      var ts = performance.now();
-      var result = state.poseLandmarker.detectForVideo(el.video, Math.round(ts));
-      var lm = (result.landmarks && result.landmarks[0]) ? result.landmarks[0] : null;
-      state.liveLandmarks = lm;
-      el.detectDot.classList.toggle("active", !!lm);
-      if (state.recording){
-        var tSec = (ts - state.recordStartTs) / 1000;
-        state.samples.push({ t: tSec, landmarks: lm });
-        el.elapsedBadge.textContent = tSec.toFixed(1) + "s / " + CONFIG.maxRecordSec.toFixed(1) + "s";
-        if (tSec >= CONFIG.maxRecordSec) stopRecording();
+      try{
+        var ts = performance.now();
+        var result = state.poseLandmarker.detectForVideo(el.video, Math.round(ts));
+        var lm = (result.landmarks && result.landmarks[0]) ? result.landmarks[0] : null;
+        state.liveLandmarks = lm;
+        el.detectDot.classList.toggle("active", !!lm);
+        if (state.recording){
+          var tSec = (ts - state.recordStartTs) / 1000;
+          state.samples.push({ t: tSec, landmarks: lm });
+          el.elapsedBadge.textContent = tSec.toFixed(1) + "s / " + CONFIG.maxRecordSec.toFixed(1) + "s";
+          if (tSec >= CONFIG.maxRecordSec) stopRecording();
+        }
+      }catch(e){
+        // 検出1回分の失敗でループ自体を止めない(iOSのバックグラウンド復帰時のWebGLコンテキストロスト等を想定)
+        console.error("pose detection error", e);
+      }finally{
+        state.liveBusy = false;
       }
-      state.liveBusy = false;
     }
-    if (state.mode === "live") drawOverlay();
-    if (state.mode === "live") state.rafId = requestAnimationFrame(tick);
+    // 例外の有無にかかわらず、ライブモードである限り描画・次フレーム予約は必ず続ける
+    if (state.mode === "live"){
+      drawOverlay();
+      state.rafId = requestAnimationFrame(tick);
+    }
   }
   tick();
 }
@@ -343,18 +382,47 @@ el.btnRecord.addEventListener("click", function(){
 function startRecording(){
   var candidates = ["video/mp4;codecs=h264", "video/mp4", "video/webm;codecs=vp8", "video/webm"];
   var mimeType = candidates.find(function(m){ return window.MediaRecorder && MediaRecorder.isTypeSupported(m); }) || "";
+
+  var recorder;
+  try{
+    recorder = mimeType ? new MediaRecorder(state.liveStream, { mimeType: mimeType }) : new MediaRecorder(state.liveStream);
+  }catch(e1){
+    try{
+      recorder = new MediaRecorder(state.liveStream);
+    }catch(e2){
+      showLiveError("このブラウザでは録画を開始できませんでした。(" + (e2 && e2.message ? e2.message : e2) + ")");
+      return;
+    }
+  }
+
+  // 録画セッションごとに世代番号とチャンク配列をクロージャで閉じ込め、
+  // 停止直後の連打で古い録画のイベントが新しい録画の状態を汚染しないようにする
+  var myGen = ++state.recordingGen;
+  var myChunks = [];
+
   state.recording = true;
   state.samples = [];
   state.recordStartTs = performance.now();
-  state.recordedChunks = [];
+  state.recorder = recorder;
+
+  recorder.ondataavailable = function(e){ if (e.data.size) myChunks.push(e.data); };
+  recorder.onstop = function(){ onRecordingFinished(myGen, myChunks, recorder); };
+  recorder.onerror = function(e){
+    if (myGen !== state.recordingGen) return;
+    state.recording = false;
+    el.btnRecord.disabled = false;
+    el.btnRecord.textContent = "録画開始";
+    el.elapsedBadge.hidden = true;
+    showLiveError("録画中にエラーが発生しました。もう一度お試しください。");
+  };
+
   try{
-    state.recorder = mimeType ? new MediaRecorder(state.liveStream, { mimeType: mimeType }) : new MediaRecorder(state.liveStream);
+    recorder.start();
   }catch(e){
-    state.recorder = new MediaRecorder(state.liveStream);
+    showLiveError("録画を開始できませんでした。(" + (e && e.message ? e.message : e) + ")");
+    return;
   }
-  state.recorder.ondataavailable = function(e){ if (e.data.size) state.recordedChunks.push(e.data); };
-  state.recorder.onstop = onRecordingFinished;
-  state.recorder.start();
+  el.liveError.hidden = true;
   el.btnRecord.textContent = "停止";
   el.elapsedBadge.hidden = false;
 }
@@ -362,30 +430,78 @@ function startRecording(){
 function stopRecording(){
   if (!state.recording) return;
   state.recording = false;
-  state.recorder.stop();
-  el.btnRecord.textContent = "録画開始";
+  el.btnRecord.disabled = true; // onstop発火まで連打での再入を防ぐ(onRecordingFinishedで解除)
+  try{
+    state.recorder.stop();
+  }catch(e){
+    // recorder.start()自体が失敗していた等、録画が正常に開始できていなかった場合の保険
+    el.btnRecord.disabled = false;
+    el.btnRecord.textContent = "録画開始";
+    el.elapsedBadge.hidden = true;
+    showLiveError("録画を停止できませんでした。もう一度お試しください。");
+  }
 }
 
-function onRecordingFinished(){
+function onRecordingFinished(myGen, chunks, recorder){
+  if (myGen !== state.recordingGen) return; // 古い世代の録画イベントは無視する
+
   if (state.liveStream){ state.liveStream.getTracks().forEach(function(tr){ tr.stop(); }); }
   cancelAnimationFrame(state.rafId);
   state.mode = "playback";
   el.panelLive.hidden = true;
   el.elapsedBadge.hidden = true;
   el.detectDot.classList.remove("active");
+  el.btnRecord.disabled = false;
+  el.btnRecord.textContent = "録画開始";
 
-  var blob = new Blob(state.recordedChunks, { type: state.recorder.mimeType || "video/webm" });
+  var totalSize = chunks.reduce(function(sum, c){ return sum + c.size; }, 0);
+  if (totalSize === 0){
+    showRecordingProblem("録画データが空でした。録画開始から数秒間、続けて撮影してください。");
+    return;
+  }
+
+  if (state.currentVideoUrl){ URL.revokeObjectURL(state.currentVideoUrl); state.currentVideoUrl = null; }
+  var blob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
   el.video.srcObject = null;
   var url = URL.createObjectURL(blob);
-  el.video.src = url;
+  state.currentVideoUrl = url;
+
+  var settled = false;
+  var loadTimeout = setTimeout(function(){
+    if (settled) return;
+    settled = true;
+    showRecordingProblem("録画した動画を読み込めませんでした。もう一度撮影してください。");
+  }, 5000);
   el.video.addEventListener("loadedmetadata", function onMeta(){
-    el.video.removeEventListener("loadedmetadata", onMeta);
+    if (settled) return;
+    settled = true;
+    clearTimeout(loadTimeout);
+    el.video.removeEventListener("error", onVideoErr);
     state.duration = el.video.duration;
     fitCanvas();
     el.panelResult.hidden = false;
     setupTransport();
     finishAnalysis();
   }, { once: true });
+  function onVideoErr(){
+    if (settled) return;
+    settled = true;
+    clearTimeout(loadTimeout);
+    showRecordingProblem("録画した動画を読み込めませんでした。もう一度撮影してください。");
+  }
+  el.video.addEventListener("error", onVideoErr, { once: true });
+  el.video.src = url;
+}
+
+function showRecordingProblem(msg){
+  el.phaseTrack.innerHTML = "";
+  el.panelResult.hidden = false;
+  el.checklist.innerHTML = "";
+  var li = document.createElement("li");
+  li.className = "check-item";
+  li.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">録画を確認できませんでした</div></div><p class="check-detail"></p>';
+  li.querySelector(".check-detail").textContent = msg;
+  el.checklist.appendChild(li);
 }
 
 function visOK(lm){ return !!lm && (lm.visibility === undefined || lm.visibility >= CONFIG.minVisibility); }
@@ -431,6 +547,24 @@ function movingAverage(arr, win){
     out[i] = sum / cnt;
   }
   return out;
+}
+
+function allNull(arr){ return arr.every(function(v){ return v == null; }); }
+
+// 角度(度)は±180°でラップアラウンドするため、通常のinterpolateNulls/movingAverageをそのまま使うと
+// 179°⇔-179°付近をまたぐ区間で実体と異なる値になる。単位円上(cos/sin)で補間・平滑化してから角度に戻す。
+function interpolateAngleNulls(arr){
+  var cosArr = arr.map(function(a){ return a == null ? null : Math.cos(a * Math.PI / 180); });
+  var sinArr = arr.map(function(a){ return a == null ? null : Math.sin(a * Math.PI / 180); });
+  var cosI = interpolateNulls(cosArr), sinI = interpolateNulls(sinArr);
+  return cosI.map(function(c, i){ return Math.atan2(sinI[i], c) * 180 / Math.PI; });
+}
+
+function smoothAngle(arr, win){
+  var cosArr = arr.map(function(a){ return Math.cos(a * Math.PI / 180); });
+  var sinArr = arr.map(function(a){ return Math.sin(a * Math.PI / 180); });
+  var cosA = movingAverage(cosArr, win), sinA = movingAverage(sinArr, win);
+  return cosA.map(function(c, i){ return Math.atan2(sinA[i], c) * 180 / Math.PI; });
 }
 
 function buildSeries(samples){
@@ -501,6 +635,7 @@ function findRotationStart(angVel, peakIdx){
 }
 
 function finishAnalysis(){
+  el.phaseTrack.innerHTML = ""; // 前回の解析結果のピンが残らないよう、分岐に入る前に必ずクリアする
   var samples = state.samples;
   if (samples.length < 4){
     el.checklist.innerHTML = "";
@@ -522,47 +657,77 @@ function finishAnalysis(){
     return;
   }
 
-  var headX = interpolateNulls(series.headX), headY = interpolateNulls(series.headY);
-  var shoulderAngle = interpolateNulls(series.shoulderAngle);
-  var hipAngle = interpolateNulls(series.hipAngle);
-  var wristX = interpolateNulls(series.wristX), wristY = interpolateNulls(series.wristY);
-  var shoulderWidth = interpolateNulls(series.shoulderWidth);
-
-  headX = movingAverage(headX, CONFIG.smoothWindow);
-  headY = movingAverage(headY, CONFIG.smoothWindow);
-  shoulderAngle = movingAverage(shoulderAngle, CONFIG.smoothWindow);
-  hipAngle = movingAverage(hipAngle, CONFIG.smoothWindow);
-  wristX = movingAverage(wristX, CONFIG.smoothWindow);
-  wristY = movingAverage(wristY, CONFIG.smoothWindow);
-
-  var wristSpeed = speedSeries(wristX, wristY, ts);
-  var hipAngVel = angularVelSeries(hipAngle, ts);
-  var shoulderAngVel = angularVelSeries(shoulderAngle, ts);
-
   var n = samples.length;
+
+  // 手首(インパクト検出の要)が録画全体で一度も検出できていない場合は、この先の指標すべてが無意味になるため打ち切る
+  if (allNull(series.wristX)){
+    el.checklist.innerHTML = "";
+    var noWrist = document.createElement("li");
+    noWrist.className = "check-item";
+    noWrist.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">手首を検出できませんでした</div></div><p class="check-detail">インパクトの位置を判定できませんでした。バットや体で手首が隠れていないか確認し、再度撮影してください。</p>';
+    el.checklist.appendChild(noWrist);
+    return;
+  }
+
+  var hipMissing = allNull(series.hipAngle);
+  var shoulderMissing = allNull(series.shoulderAngle);
+  if (hipMissing && shoulderMissing){
+    el.checklist.innerHTML = "";
+    var noRot = document.createElement("li");
+    noRot.className = "check-item";
+    noRot.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">骨盤・肩を検出できませんでした</div></div><p class="check-detail">回転のタイミングを判定できませんでした。打者と骨格線がはっきり映る位置・距離で再度撮影してください。</p>';
+    el.checklist.appendChild(noRot);
+    return;
+  }
+
+  var wristX = movingAverage(interpolateNulls(series.wristX), CONFIG.smoothWindow);
+  var wristY = movingAverage(interpolateNulls(series.wristY), CONFIG.smoothWindow);
+  var wristSpeed = speedSeries(wristX, wristY, ts);
   var impactIdx = argmax(wristSpeed, Math.floor(n * 0.15), n - 1);
-  var hipStartIdx = findRotationStart(hipAngVel, impactIdx);
-  var shoulderStartIdx = findRotationStart(shoulderAngVel, impactIdx);
-  var rotationStartIdx = Math.min(hipStartIdx, shoulderStartIdx);
 
-  var refShoulderWidth = shoulderWidth[0] || shoulderWidth.find(function(v){ return v > 0; }) || 1;
-  var headDisp = dist(
-    { x: headX[rotationStartIdx], y: headY[rotationStartIdx] },
-    { x: headX[impactIdx], y: headY[impactIdx] }
-  );
-  var wobbleRatio = headDisp / refShoulderWidth;
+  var hipStartIdx = null, shoulderStartIdx = null;
+  if (!hipMissing){
+    var hipAngle = smoothAngle(interpolateAngleNulls(series.hipAngle), CONFIG.smoothWindow);
+    hipStartIdx = findRotationStart(angularVelSeries(hipAngle, ts), impactIdx);
+  }
+  if (!shoulderMissing){
+    var shoulderAngle = smoothAngle(interpolateAngleNulls(series.shoulderAngle), CONFIG.smoothWindow);
+    shoulderStartIdx = findRotationStart(angularVelSeries(shoulderAngle, ts), impactIdx);
+  }
+  var rotationStartIdx = !hipMissing && !shoulderMissing ? Math.min(hipStartIdx, shoulderStartIdx)
+    : (!hipMissing ? hipStartIdx : shoulderStartIdx);
 
-  var leadMs = (ts[shoulderStartIdx] - ts[hipStartIdx]) * 1000;
+  // インパクトが回転開始と同一コマ以前(検出ノイズ・極端に短い録画)の場合、所要時間・頭部ブレは自己参照の0になり信頼できない
   var swingMs = (ts[impactIdx] - ts[rotationStartIdx]) * 1000;
+  var timingReliable = impactIdx > rotationStartIdx && swingMs >= 20;
 
-  renderPhaseTrack([
-    { t: ts[hipStartIdx], label: "骨盤始動", cls: "pin-hip" },
-    { t: ts[shoulderStartIdx], label: "肩始動", cls: "pin-shoulder" },
-    { t: ts[impactIdx], label: "インパクト", cls: "pin-impact" }
-  ]);
+  var checklistItems = [];
 
-  renderChecklist([
-    {
+  if (allNull(series.headX) || allNull(series.shoulderWidth)){
+    checklistItems.push({
+      title: "頭の水平・上下のブレ(両耳の中心)",
+      verdict: "na",
+      detail: "両耳または肩を十分に検出できなかったため、頭部のブレは計測できませんでした。",
+      jumps: []
+    });
+  } else if (!timingReliable){
+    checklistItems.push({
+      title: "頭の水平・上下のブレ(両耳の中心)",
+      verdict: "na",
+      detail: "回転開始とインパクトの区別がつかず、頭部のブレは計測できませんでした。もう少し長めに撮影してください。",
+      jumps: []
+    });
+  } else {
+    var headX = movingAverage(interpolateNulls(series.headX), CONFIG.smoothWindow);
+    var headY = movingAverage(interpolateNulls(series.headY), CONFIG.smoothWindow);
+    var shoulderWidth = interpolateNulls(series.shoulderWidth);
+    var refShoulderWidth = shoulderWidth.find(function(v){ return v > 0; }) || null;
+    var headDisp = dist(
+      { x: headX[rotationStartIdx], y: headY[rotationStartIdx] },
+      { x: headX[impactIdx], y: headY[impactIdx] }
+    );
+    var wobbleRatio = headDisp / refShoulderWidth;
+    checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
       detail: "回転開始からインパクトまでの頭部(両耳の中心)の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)",
@@ -570,8 +735,19 @@ function finishAnalysis(){
         { label: "回転開始を見る", t: ts[rotationStartIdx] },
         { label: "インパクトを見る", t: ts[impactIdx] }
       ]
-    },
-    {
+    });
+  }
+
+  if (hipMissing || shoulderMissing){
+    checklistItems.push({
+      title: "回転の順序(骨盤が肩より先行しているか)",
+      verdict: "na",
+      detail: (hipMissing ? "骨盤" : "肩") + "を十分に検出できなかったため、回転の順序は判定できませんでした。",
+      jumps: []
+    });
+  } else {
+    var leadMs = (ts[shoulderStartIdx] - ts[hipStartIdx]) * 1000;
+    checklistItems.push({
       title: "回転の順序(骨盤が肩より先行しているか)",
       verdict: leadMs >= CONFIG.rotationLead.goodLeadMs ? "ok" : (leadMs >= CONFIG.rotationLead.okLeadMs ? "mid" : "ng"),
       detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)",
@@ -579,8 +755,18 @@ function finishAnalysis(){
         { label: "骨盤の始動を見る", t: ts[hipStartIdx] },
         { label: "肩の始動を見る", t: ts[shoulderStartIdx] }
       ]
-    },
-    {
+    });
+  }
+
+  if (!timingReliable){
+    checklistItems.push({
+      title: "始動〜インパクトの所要時間(参考値)",
+      verdict: "na",
+      detail: "回転開始とインパクトの区別がつかず、所要時間を計測できませんでした。もう少し長めに撮影してください。",
+      jumps: []
+    });
+  } else {
+    checklistItems.push({
       title: "始動〜インパクトの所要時間(参考値)",
       verdict: "na",
       detail: "回転開始からインパクトまで約 " + Math.round(swingMs) + "ms でした。一般に上級者は120〜180ms程度とされますが、レベルやスイングタイプで幅があるため、あくまで参考値としてご覧ください。",
@@ -588,8 +774,15 @@ function finishAnalysis(){
         { label: "回転開始を見る", t: ts[rotationStartIdx] },
         { label: "インパクトを見る", t: ts[impactIdx] }
       ]
-    }
-  ]);
+    });
+  }
+
+  var pins = [{ t: ts[impactIdx], label: "インパクト", cls: "pin-impact" }];
+  if (!hipMissing) pins.push({ t: ts[hipStartIdx], label: "骨盤始動", cls: "pin-hip" });
+  if (!shoulderMissing) pins.push({ t: ts[shoulderStartIdx], label: "肩始動", cls: "pin-shoulder" });
+  renderPhaseTrack(pins);
+
+  renderChecklist(checklistItems);
 }
 
 function renderPhaseTrack(pins){
@@ -716,7 +909,9 @@ function startPlaybackOverlayLoop(){
 
 function resetApp(){
   cancelAnimationFrame(state.rafId);
+  state.recordingGen++; // 進行中の録画があれば、その古いonstop/onerrorを無効化する
   if (state.liveStream){ state.liveStream.getTracks().forEach(function(tr){ tr.stop(); }); state.liveStream = null; }
+  if (state.currentVideoUrl){ URL.revokeObjectURL(state.currentVideoUrl); state.currentVideoUrl = null; }
   el.video.pause();
   el.video.removeAttribute("src");
   el.video.srcObject = null;
@@ -726,7 +921,10 @@ function resetApp(){
   el.stageWrap.hidden = true;
   el.panelStart.hidden = false;
   el.startError.hidden = true;
+  el.liveError.hidden = true;
+  el.btnRecord.disabled = false;
   el.btnRecord.textContent = "録画開始";
+  el.phaseTrack.innerHTML = "";
   state.mode = "idle";
   state.samples = []; state.duration = 0; state.recording = false;
 }
@@ -776,6 +974,20 @@ function drawOverlay(){
     ctx.fill();
   });
 }
+</script>
+<script>
+// ESモジュール(MediaPipe CDN)の読み込み自体が失敗すると上のscriptは一切実行されないため、
+// 通常のscriptから一定時間後に起動フラグを確認し、無反応のまま固まっている場合はエラーを表示する
+setTimeout(function(){
+  if (window.__appBooted) return;
+  var errEl = document.getElementById("startError");
+  if (errEl){
+    errEl.hidden = false;
+    errEl.textContent = "アプリの読み込みに失敗しました。インターネット接続を確認し、ページを再読み込みしてください。(解析エンジンの読み込みエラー)";
+  }
+  var badge = document.getElementById("statusBadge");
+  if (badge) badge.textContent = "読み込み失敗";
+}, 4000);
 </script>
 </body>
 </html>

@@ -182,7 +182,7 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
     <p class="fine-print">
       判定は単眼カメラの2D映像からの<b>推定値</b>です。撮影角度・明るさ・映り込みで数値は変動します。最終的な判断はご自身の目で確認してください。<br>
       背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。<br>
-      スピードは手首の動きから推定した<b>手元の速さ</b>であり、バットは検出していません。バット先端の実速度とは異なります。入力した肩幅を基準に換算するため、肩幅の入力値の正確さが推定精度に直結します。<br>
+      スピードは手首の動きから推定した<b>手元の速さ</b>であり、バットは検出していません。バット先端の実速度とは異なります。解析モデルが画像から推定する3D身体モデルを、入力した肩幅で補正して換算するため、肩幅の入力値の正確さが推定精度に直結します。<br>
       録画は最大<span id="finePrintMaxSec"></span>秒で自動停止します。判定基準の数値はコード先頭の CONFIG に集約されています。現場の感覚に合わせて書き換えてください。
     </p>
   </section>
@@ -199,7 +199,10 @@ var CONFIG = {
   smoothWindow: 5,                 // 角度・速度算出前の移動平均(コマ数)
   minVisibility: 0.5,              // このスコア未満のランドマークは信頼しない
   minValidRatio: 0.5,              // 有効コマの割合がこれ未満なら「検出精度が低い」警告
-  headWobble: { goodMax: 0.08, okMax: 0.15 },   // 肩幅に対する頭部(両耳中心)移動量の比率
+  // 肩幅に対する頭部(両耳中心)移動量の比率。この数値はもともと2D画像座標ベースの比で調整したもので、
+  // 3Dワールド座標ベースに切り替えた後は未検証(奥行き方向の頭の動きも含まれるため、同じ動きでも
+  // 従来より大きい値が出やすいと考えられる)。実際の録画で分布を見てから調整すること。
+  headWobble: { goodMax: 0.08, okMax: 0.15 },
   rotationLead: { goodLeadMs: 60, okLeadMs: 0 }, // 骨盤が肩より何ms早く回り始めれば良いか
   angularVelThresholdRatio: 0.15,  // 回転「開始」とみなす、ピーク角速度に対する比率
   stepFallbackSec: 1/30,           // コマ送りボタンの移動量(秒、再生時)
@@ -250,7 +253,7 @@ var state = {
   recordingGen: 0,     // 録画セッションの世代。古い録画のonstop/onerrorが新しい録画を汚染しないためのガード
   currentVideoUrl: null, // 再生用Blob URL(撮り直し時にrevokeするため保持)
   shoulderWidthCm: 38, // カメラ起動時点の入力値をスナップショット(録画中に入力欄が変わっても解析には影響させない)
-  samples: [],        // [{t, landmarks}] (t: 秒)
+  samples: [],        // [{t, landmarks, worldLandmarks}] (t: 秒)
   duration: 0,
   rafId: null,
   transportReady: false
@@ -277,7 +280,8 @@ async function initPoseLandmarker(){
   var vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
   );
-  var modelUrl = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+  // liteより精度が高いfullモデル。サイズはliteの約1.6倍で、iPhoneのGPUなら実時間処理に問題ない見込み
+  var modelUrl = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
   try{
     return await PoseLandmarker.createFromOptions(vision, {
       baseOptions: { modelAssetPath: modelUrl, delegate: "GPU" },
@@ -366,11 +370,13 @@ function startLiveLoop(){
         var ts = performance.now();
         var result = state.poseLandmarker.detectForVideo(el.video, Math.round(ts));
         var lm = (result.landmarks && result.landmarks[0]) ? result.landmarks[0] : null;
+        // worldLandmarks: 両股関節の中点を原点とした実メートル単位の3D座標。距離・速度の計算はこちらを使う
+        var wlm = (result.worldLandmarks && result.worldLandmarks[0]) ? result.worldLandmarks[0] : null;
         state.liveLandmarks = lm;
         el.detectDot.classList.toggle("active", !!lm);
         if (state.recording){
           var tSec = (ts - state.recordStartTs) / 1000;
-          state.samples.push({ t: tSec, landmarks: lm });
+          state.samples.push({ t: tSec, landmarks: lm, worldLandmarks: wlm });
           el.elapsedBadge.textContent = tSec.toFixed(1) + "s / " + CONFIG.maxRecordSec.toFixed(1) + "s";
           if (tSec >= CONFIG.maxRecordSec) stopRecording();
         }
@@ -520,10 +526,9 @@ function showRecordingProblem(msg){
 }
 
 function visOK(lm){ return !!lm && (lm.visibility === undefined || lm.visibility >= CONFIG.minVisibility); }
-// ランドマークのx/yはそれぞれ画像の幅・高さで正規化されており、フレームが正方形でない限り
-// 正規化x単位1と正規化y単位1は異なる物理距離に対応する。yScale(videoHeight/videoWidth)を掛けて
-// 「正規化x単位」に揃えてから合成することで、非正方形フレーム(例: 1280x720)での歪みを補正する。
-function dist(a, b, yScale){ var dx = a.x - b.x, dy = (a.y - b.y) * (yScale || 1); return Math.sqrt(dx*dx + dy*dy); }
+// worldLandmarksは両股関節の中点を原点とした実メートル単位の3D座標。画像の縦横比に依存せず、
+// 体が回転しても(2D画像上の投影と違って)実寸が縮まないため、距離・速度の計算はこちらを使う。
+function dist3D(a, b){ var dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z; return Math.sqrt(dx*dx + dy*dy + dz*dz); }
 function angleDeg(a, b){ return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }
 function angleDiffDeg(a, b){
   var d = b - a;
@@ -591,31 +596,49 @@ function smoothAngle(arr, win){
   return cosA.map(function(c, i){ return Math.atan2(sinA[i], c) * 180 / Math.PI; });
 }
 
-function buildSeries(samples, yScale){
+function buildSeries(samples){
   var n = samples.length;
+  // 回転の順序判定は引き続き2D画像座標(shoulderAngle/hipAngle)を使う。3Dワールド座標の軸の向きを
+  // 断定できるほどの確証がないため、角度計算はここでは切り替えない。
   var shoulderAngle = new Array(n).fill(null);
   var hipAngle = new Array(n).fill(null);
-  var headX = new Array(n).fill(null), headY = new Array(n).fill(null);
-  var wristX = new Array(n).fill(null), wristY = new Array(n).fill(null);
-  var shoulderWidth = new Array(n).fill(null);
+  // 頭部・手首の位置と肩幅は、画像縦横比や体の向きの影響を受けない3Dワールド座標(メートル単位)で計算する
+  var headWX = new Array(n).fill(null), headWY = new Array(n).fill(null), headWZ = new Array(n).fill(null);
+  var wristWX = new Array(n).fill(null), wristWY = new Array(n).fill(null), wristWZ = new Array(n).fill(null);
+  var shoulderWidthM = new Array(n).fill(null);
   var validCount = 0;
+  var worldValidCount = 0; // result.worldLandmarksが取得できたコマ数(2DのvalidCountとは別に集計)
   for (var i = 0; i < n; i++){
     var lm = samples[i].landmarks;
     if (!lm) continue;
     validCount++;
     var ls = lm[LM.lShoulder], rs = lm[LM.rShoulder], lh = lm[LM.lHip], rh = lm[LM.rHip];
-    var le = lm[LM.lEar], re = lm[LM.rEar], lw = lm[LM.lWrist], rw = lm[LM.rWrist];
-    if (visOK(ls) && visOK(rs)){ shoulderAngle[i] = angleDeg(ls, rs); shoulderWidth[i] = dist(ls, rs, yScale); }
-    if (visOK(lh) && visOK(rh)){ hipAngle[i] = angleDeg(lh, rh); }
+    if (visOK(ls) && visOK(rs)) shoulderAngle[i] = angleDeg(ls, rs);
+    if (visOK(lh) && visOK(rh)) hipAngle[i] = angleDeg(lh, rh);
+
+    var wlm = samples[i].worldLandmarks;
+    if (!wlm) continue;
+    worldValidCount++;
+    var wls = wlm[LM.lShoulder], wrs = wlm[LM.rShoulder];
+    var wle = wlm[LM.lEar], wre = wlm[LM.rEar];
+    var wlw = wlm[LM.lWrist], wrw = wlm[LM.rWrist];
+    if (visOK(wls) && visOK(wrs)) shoulderWidthM[i] = dist3D(wls, wrs);
     // 背面からの撮影のため顔(鼻)は写らない前提。両耳の中心を頭部位置の代わりに使う
-    if (visOK(le) && visOK(re)){ headX[i] = (le.x + re.x) / 2; headY[i] = (le.y + re.y) / 2; }
-    else if (visOK(le)){ headX[i] = le.x; headY[i] = le.y; }
-    else if (visOK(re)){ headX[i] = re.x; headY[i] = re.y; }
-    if (visOK(lw) && visOK(rw)){ wristX[i] = (lw.x + rw.x) / 2; wristY[i] = (lw.y + rw.y) / 2; }
-    else if (visOK(lw)){ wristX[i] = lw.x; wristY[i] = lw.y; }
-    else if (visOK(rw)){ wristX[i] = rw.x; wristY[i] = rw.y; }
+    if (visOK(wle) && visOK(wre)){ headWX[i] = (wle.x + wre.x) / 2; headWY[i] = (wle.y + wre.y) / 2; headWZ[i] = (wle.z + wre.z) / 2; }
+    else if (visOK(wle)){ headWX[i] = wle.x; headWY[i] = wle.y; headWZ[i] = wle.z; }
+    else if (visOK(wre)){ headWX[i] = wre.x; headWY[i] = wre.y; headWZ[i] = wre.z; }
+    if (visOK(wlw) && visOK(wrw)){ wristWX[i] = (wlw.x + wrw.x) / 2; wristWY[i] = (wlw.y + wrw.y) / 2; wristWZ[i] = (wlw.z + wrw.z) / 2; }
+    else if (visOK(wlw)){ wristWX[i] = wlw.x; wristWY[i] = wlw.y; wristWZ[i] = wlw.z; }
+    else if (visOK(wrw)){ wristWX[i] = wrw.x; wristWY[i] = wrw.y; wristWZ[i] = wrw.z; }
   }
-  return { shoulderAngle: shoulderAngle, hipAngle: hipAngle, headX: headX, headY: headY, wristX: wristX, wristY: wristY, shoulderWidth: shoulderWidth, validRatio: n ? validCount / n : 0 };
+  return {
+    shoulderAngle: shoulderAngle, hipAngle: hipAngle,
+    headWX: headWX, headWY: headWY, headWZ: headWZ,
+    wristWX: wristWX, wristWY: wristWY, wristWZ: wristWZ,
+    shoulderWidthM: shoulderWidthM,
+    validRatio: n ? validCount / n : 0,
+    worldValidRatio: n ? worldValidCount / n : 0
+  };
 }
 
 function angularVelSeries(angleArr, ts){
@@ -629,13 +652,13 @@ function angularVelSeries(angleArr, ts){
   return out;
 }
 
-function speedSeries(xs, ys, ts, yScale){
+function speedSeries3D(xs, ys, zs, ts){
   var n = xs.length, out = new Array(n).fill(0);
   for (var i = 1; i < n; i++){
     var dt = ts[i] - ts[i-1];
     if (dt <= 0){ out[i] = out[i-1]; continue; }
-    var dx = xs[i] - xs[i-1], dy = (ys[i] - ys[i-1]) * (yScale || 1);
-    out[i] = Math.sqrt(dx*dx + dy*dy) / dt;
+    var dx = xs[i] - xs[i-1], dy = ys[i] - ys[i-1], dz = zs[i] - zs[i-1];
+    out[i] = Math.sqrt(dx*dx + dy*dy + dz*dz) / dt; // m/s
   }
   out[0] = out[1] || 0;
   return out;
@@ -670,10 +693,7 @@ function finishAnalysis(){
     return;
   }
   var ts = samples.map(function(s){ return s.t; });
-  // ランドマークのx/yはフレーム幅・高さそれぞれで正規化されているため、正方形でないフレーム(既定1280x720)では
-  // xとyを単純に合成すると歪む。yをこの係数で補正してから使うことで「正規化x単位」に揃える。
-  var aspectCorrection = (el.video.videoWidth && el.video.videoHeight) ? (el.video.videoHeight / el.video.videoWidth) : 1;
-  var series = buildSeries(samples, aspectCorrection);
+  var series = buildSeries(samples);
 
   if (series.validRatio < CONFIG.minValidRatio){
     el.checklist.innerHTML = "";
@@ -684,10 +704,21 @@ function finishAnalysis(){
     return;
   }
 
+  // 2Dの骨格自体は検出できていても、奥行きを含む3D推定(worldLandmarks)だけが不安定なことがある。
+  // これは頭部ブレ・手元スピード・肩幅換算のすべてがworldLandmarksに依存するため、別途ゲートする。
+  if (series.worldValidRatio < CONFIG.minValidRatio){
+    el.checklist.innerHTML = "";
+    var warnW = document.createElement("li");
+    warnW.className = "check-item";
+    warnW.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">3D姿勢の推定が不安定です</div></div><p class="check-detail">体の輪郭は検出できていますが、奥行きを含む3D推定が十分安定しませんでした(有効コマ率 ' + Math.round(series.worldValidRatio*100) + '%)。撮影距離・明るさ・映り込みを見直して再度お試しください。</p>';
+    el.checklist.appendChild(warnW);
+    return;
+  }
+
   var n = samples.length;
 
   // 手首(インパクト検出の要)が録画全体で一度も検出できていない場合は、この先の指標すべてが無意味になるため打ち切る
-  if (allNull(series.wristX)){
+  if (allNull(series.wristWX)){
     el.checklist.innerHTML = "";
     var noWrist = document.createElement("li");
     noWrist.className = "check-item";
@@ -707,9 +738,10 @@ function finishAnalysis(){
     return;
   }
 
-  var wristX = movingAverage(interpolateNulls(series.wristX), CONFIG.smoothWindow);
-  var wristY = movingAverage(interpolateNulls(series.wristY), CONFIG.smoothWindow);
-  var wristSpeed = speedSeries(wristX, wristY, ts, aspectCorrection);
+  var wristX = movingAverage(interpolateNulls(series.wristWX), CONFIG.smoothWindow);
+  var wristY = movingAverage(interpolateNulls(series.wristWY), CONFIG.smoothWindow);
+  var wristZ = movingAverage(interpolateNulls(series.wristWZ), CONFIG.smoothWindow);
+  var wristSpeed = speedSeries3D(wristX, wristY, wristZ, ts); // m/s(ワールド座標)
   var impactIdx = argmax(wristSpeed, Math.floor(n * 0.15), n - 1);
 
   var hipStartIdx = null, shoulderStartIdx = null;
@@ -724,24 +756,35 @@ function finishAnalysis(){
   var rotationStartIdx = !hipMissing && !shoulderMissing ? Math.min(hipStartIdx, shoulderStartIdx)
     : (!hipMissing ? hipStartIdx : shoulderStartIdx);
 
-  // 肩幅(cm入力)を基準に、正規化座標→実距離のおおまかな換算スケールを作る(頭部ブレ・手元スピード推定の両方で使う)。
-  // 体が回転すると肩幅の見かけの投影長が縮むため、回転開始より前(構えに近い区間)の複数コマの中央値を基準にする。
-  var shoulderWidthSeries = allNull(series.shoulderWidth) ? null : interpolateNulls(series.shoulderWidth);
-  var refShoulderWidthNorm = null;
+  // 肩幅(cm入力)を基準に、モデルのワールド座標推定値を実寸に近づける補正係数を作る(手元スピード推定で使う)。
+  // ワールド座標は3D距離のため体の向きによる縮みは生じないが、フレームごとの検出ノイズを避けるため
+  // 回転開始より前(構えに近い区間)の複数コマの中央値を基準にする。
+  var shoulderWidthSeries = allNull(series.shoulderWidthM) ? null : interpolateNulls(series.shoulderWidthM);
+  var refShoulderWidthM = null;
   if (shoulderWidthSeries){
     var addressWidths = shoulderWidthSeries.slice(0, rotationStartIdx + 1).filter(function(v){ return v > 0; });
-    refShoulderWidthNorm = addressWidths.length ? median(addressWidths) : null;
+    refShoulderWidthM = addressWidths.length ? median(addressWidths) : null;
   }
   var userShoulderWidthCm = state.shoulderWidthCm;
-  var cmPerNormUnit = refShoulderWidthNorm ? (userShoulderWidthCm / refShoulderWidthNorm) : null;
+  // ワールド座標はモデルが学習した平均的な体格を前提にした推定値なので、実際の肩幅とのズレを補正する係数。
+  // 頭部ブレの比率(wobbleRatio)は分子・分母とも同じワールド座標基準なのでこの係数の影響を受けず不要。
+  var scaleCorrection = refShoulderWidthM ? ((userShoulderWidthCm / 100) / refShoulderWidthM) : null;
 
   // インパクトが回転開始と同一コマ以前(検出ノイズ・極端に短い録画)の場合、所要時間・頭部ブレは自己参照の0になり信頼できない
   var swingMs = (ts[impactIdx] - ts[rotationStartIdx]) * 1000;
   var timingReliable = impactIdx > rotationStartIdx && swingMs >= 20;
 
+  // 端末の性能・fullモデルへの変更等で実効的な検出頻度(コマの間隔)が粗くなることがある。
+  // ms単位の数値を精密であるかのように見せないよう、間隔が粗い場合は注記を添える。
+  var avgDt = (ts[n-1] - ts[0]) / Math.max(1, n - 1);
+  var lowSamplingRate = avgDt > 0.05; // 目安: 実効20fps相当を下回る
+  var samplingNote = lowSamplingRate
+    ? " ただしこの録画は検出間隔が粗く(平均" + Math.round(avgDt*1000) + "ms)、ms単位の数値はおおまかな目安です。"
+    : "";
+
   var checklistItems = [];
 
-  if (allNull(series.headX) || !refShoulderWidthNorm){
+  if (allNull(series.headWX) || !refShoulderWidthM){
     checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: "na",
@@ -756,14 +799,14 @@ function finishAnalysis(){
       jumps: []
     });
   } else {
-    var headX = movingAverage(interpolateNulls(series.headX), CONFIG.smoothWindow);
-    var headY = movingAverage(interpolateNulls(series.headY), CONFIG.smoothWindow);
-    var headDisp = dist(
-      { x: headX[rotationStartIdx], y: headY[rotationStartIdx] },
-      { x: headX[impactIdx], y: headY[impactIdx] },
-      aspectCorrection
+    var headX = movingAverage(interpolateNulls(series.headWX), CONFIG.smoothWindow);
+    var headY = movingAverage(interpolateNulls(series.headWY), CONFIG.smoothWindow);
+    var headZ = movingAverage(interpolateNulls(series.headWZ), CONFIG.smoothWindow);
+    var headDisp = dist3D(
+      { x: headX[rotationStartIdx], y: headY[rotationStartIdx], z: headZ[rotationStartIdx] },
+      { x: headX[impactIdx], y: headY[impactIdx], z: headZ[impactIdx] }
     );
-    var wobbleRatio = headDisp / refShoulderWidthNorm;
+    var wobbleRatio = headDisp / refShoulderWidthM;
     checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
@@ -787,7 +830,7 @@ function finishAnalysis(){
     checklistItems.push({
       title: "回転の順序(骨盤が肩より先行しているか)",
       verdict: leadMs >= CONFIG.rotationLead.goodLeadMs ? "ok" : (leadMs >= CONFIG.rotationLead.okLeadMs ? "mid" : "ng"),
-      detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)",
+      detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)" + samplingNote,
       jumps: [
         { label: "骨盤の始動を見る", t: ts[hipStartIdx] },
         { label: "肩の始動を見る", t: ts[shoulderStartIdx] }
@@ -806,7 +849,7 @@ function finishAnalysis(){
     checklistItems.push({
       title: "始動〜インパクトの所要時間(参考値)",
       verdict: "na",
-      detail: "回転開始からインパクトまで約 " + Math.round(swingMs) + "ms でした。一般に上級者は120〜180ms程度とされますが、レベルやスイングタイプで幅があるため、あくまで参考値としてご覧ください。",
+      detail: "回転開始からインパクトまで約 " + Math.round(swingMs) + "ms でした。一般に上級者は120〜180ms程度とされますが、レベルやスイングタイプで幅があるため、あくまで参考値としてご覧ください。" + samplingNote,
       jumps: [
         { label: "回転開始を見る", t: ts[rotationStartIdx] },
         { label: "インパクトを見る", t: ts[impactIdx] }
@@ -816,7 +859,7 @@ function finishAnalysis(){
 
   // 手元(グリップ)の最大スピード推定。バット先端は手元より速く動く(てこの原理)ため、
   // ここで出る数値はバットスピードそのものではなく、それより控えめな「手元の速さ」の推定値であることに注意。
-  if (!cmPerNormUnit){
+  if (!scaleCorrection){
     checklistItems.push({
       title: "手元の最大スピード(推定)",
       verdict: "na",
@@ -824,7 +867,7 @@ function finishAnalysis(){
       jumps: []
     });
   } else {
-    var speedKmh = wristSpeed[impactIdx] * cmPerNormUnit * 0.036; // cm/s → km/h
+    var speedKmh = wristSpeed[impactIdx] * scaleCorrection * 3.6; // m/s → km/h
     if (!isFinite(speedKmh) || speedKmh < CONFIG.speedSanity.minKmh || speedKmh > CONFIG.speedSanity.maxKmh){
       checklistItems.push({
         title: "手元の最大スピード(推定)",

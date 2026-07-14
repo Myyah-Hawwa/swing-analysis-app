@@ -810,7 +810,8 @@ function finishAnalysis(){
     checklistItems.push({
       title: "頭の水平・上下のブレ(両耳の中心)",
       verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
-      detail: "回転開始からインパクトまでの頭部(両耳の中心)の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)",
+      detail: "回転開始からインパクトまでの頭部(両耳の中心)の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)"
+        + " この目安は奥行きを含む3D計測に切り替えた後まだ実データで検証していません。判定に違和感があれば数値だけ参考にし、コード先頭のCONFIG.headWobbleを実際の見え方に合わせて調整してください。",
       jumps: [
         { label: "回転開始を見る", t: ts[rotationStartIdx] },
         { label: "インパクトを見る", t: ts[impactIdx] }

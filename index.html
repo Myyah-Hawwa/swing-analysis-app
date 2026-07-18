@@ -26,7 +26,7 @@
   --shadow:0 1px 0 rgba(27,42,74,.05), 0 8px 20px rgba(27,42,74,.09);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-html,body{margin:0;padding:0;height:100%;}
+html,body{margin:0;padding:0;height:100%;overscroll-behavior-y:contain;} /* Android Chromeの「引っ張って更新」で録画・解析結果が消えるのを防ぐ */
 body{
   font-family:"Yu Gothic","游ゴシック",YuGothic,"Hiragino Kaku Gothic ProN","Hiragino Sans",Meiryo,system-ui,sans-serif;
   color:var(--ink);
@@ -124,7 +124,7 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
   </div>
 
   <section id="panelStart" class="panel">
-    <p class="lead">iPhoneのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。</p>
+    <p class="lead">スマートフォンのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。</p>
     <ul class="hint-list">
       <li>撮影は<b>捕手側・打者の背後</b>から。打者の背中越しに投手方向を見る構図にしてください</li>
       <li>打者一人が画面の大部分を占めるように。他の人が大きく写り込むと誤検出します</li>
@@ -210,7 +210,20 @@ var CONFIG = {
 };
 
 var LM = { nose:0, lEar:7, rEar:8, lShoulder:11, rShoulder:12, lElbow:13, rElbow:14, lWrist:15, rWrist:16, lHip:23, rHip:24, lKnee:25, rKnee:26, lAnkle:27, rAnkle:28 };
-var CONNECTIONS = [[7,8],[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+// 骨格オーバーレイの線。体幹・四肢に加えて手(指の付け根)と足先まで描き、体の動きを細かく可視化する。
+// MediaPipe Poseの33点: 15/16=手首, 17-22=手(小指/人差し指/親指), 27/28=足首, 29-32=かかと/つま先
+var CONNECTIONS = [
+  [7,8],                                              // 両耳(頭の向き)
+  [11,12],[11,13],[13,15],[12,14],[14,16],           // 肩・上腕・前腕
+  [15,17],[15,19],[15,21],[17,19],                   // 左手(手首→小指/人差し指/親指)
+  [16,18],[16,20],[16,22],[18,20],                   // 右手
+  [11,23],[12,24],[23,24],                           // 胴
+  [23,25],[25,27],[24,26],[26,28],                   // 腿・すね
+  [27,29],[27,31],[29,31],                           // 左足(足首→かかと/つま先)
+  [28,30],[28,32],[30,32]                            // 右足
+];
+// 関節点として丸を描くランドマーク(目・口は省いてごちゃつきを避ける)
+var DRAW_POINTS = [0,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32];
 
 var el = {
   statusBadge: document.getElementById("statusBadge"),
@@ -256,7 +269,9 @@ var state = {
   samples: [],        // [{t, landmarks, worldLandmarks}] (t: 秒)
   duration: 0,
   rafId: null,
-  transportReady: false
+  transportReady: false,
+  smoothLive: null,    // ライブ表示のちらつきを抑えるための平滑化済み骨格(表示専用。解析用サンプルには使わない)
+  refining: false      // 撮影後の密再解析(コマ送り検出)の実行中フラグ
 };
 
 // 録画中・プレビュー中にタブがバックグラウンド化したら、気づかないまま録画が続くのを防ぐため録画を打ち切る
@@ -363,6 +378,7 @@ window.addEventListener("resize", fitCanvas);
 /* ==== ライブ検出ループ(録画前のプレビュー中も、録画中も動く) ==== */
 function startLiveLoop(){
   cancelAnimationFrame(state.rafId);
+  state.smoothLive = null; // 新しいライブセッションでは平滑化をリセット
   function tick(){
     if (!state.liveBusy && state.poseLandmarker && el.video.readyState >= 2){
       state.liveBusy = true;
@@ -501,8 +517,18 @@ function onRecordingFinished(myGen, chunks, recorder){
     state.duration = el.video.duration;
     fitCanvas();
     el.panelResult.hidden = false;
-    setupTransport();
-    finishAnalysis();
+    // 撮影後にクリップをコマ送りで再解析し、ライブ検出より密なサンプルを作ってから解析する。
+    // 失敗・タイムアウト時はライブ検出のサンプルにそのまま縮退する(現状維持)。
+    refineSamplesOffline().then(function(){
+      // Android ChromeのMediaRecorderはwebm/fMP4にdurationを書き込まずInfinityになる既知バグがある。
+      // 有限にならなければ録画サンプルの最終時刻で代用し、シークバーやフェーズピンが壊れないようにする。
+      if (!isFinite(state.duration) || state.duration <= 0){
+        state.duration = state.samples.length ? state.samples[state.samples.length - 1].t : (isFinite(el.video.duration) ? el.video.duration : 0);
+      }
+      setupTransport();
+      finishAnalysis();
+      drawOverlay(); // 先頭フレームの骨格を最初から表示しておく
+    });
   }, { once: true });
   function onVideoErr(){
     if (settled) return;
@@ -523,6 +549,95 @@ function showRecordingProblem(msg){
   li.innerHTML = '<div class="check-head"><div class="check-mark mark-na">?</div><div class="check-title">録画を確認できませんでした</div></div><p class="check-detail"></p>';
   li.querySelector(".check-detail").textContent = msg;
   el.checklist.appendChild(li);
+}
+
+// 録画クリップを撮影後にコマ送りで再解析する。ライブ検出は端末性能により実効10fps前後まで落ちるが、
+// 録画済み映像はリアルタイムより遅くてよいので、ほぼ全コマ(最大30fps相当)を拾える。これにより
+// 体の動きを細かくとらえ、回転順序・インパクト・所要時間のms計測の信頼性を上げる。
+// 何らかの理由で失敗・タイムアウトしても、必ずライブ検出のサンプルにそのまま縮退する。
+function refineSamplesOffline(){
+  return new Promise(function(resolve){
+    if (!state.poseLandmarker || !el.video || !window.Promise){ resolve(); return; }
+    state.refining = true;
+    resolveDuration().then(function(dur){
+      if (!isFinite(dur) || dur <= 0){ state.refining = false; resolve(); return; } // 尺不明ならライブ検出のまま
+      var maxFrames = 300;                          // 長尺でも解析時間の上限を確保
+      var step = Math.max(1/30, dur / maxFrames);   // 最大30fps相当。長尺だけ間引く
+      var times = [];
+      for (var t = 0; t <= dur + 1e-6; t += step) times.push(Math.min(t, dur));
+      var dense = [];
+      var lastTs = Math.round(performance.now());   // VIDEOモードは単調増加タイムスタンプが必要
+      var i = 0;
+      el.video.pause();
+      el.elapsedBadge.hidden = false;
+
+      function seekTo(tt){
+        return new Promise(function(res){
+          var done = false;
+          function onSeeked(){ if (done) return; done = true; el.video.removeEventListener("seeked", onSeeked); res(true); }
+          el.video.addEventListener("seeked", onSeeked);
+          try{ el.video.currentTime = tt; }
+          catch(e){ if (!done){ done = true; el.video.removeEventListener("seeked", onSeeked); res(false); } return; }
+          setTimeout(function(){ if (done) return; done = true; el.video.removeEventListener("seeked", onSeeked); res(false); }, 1500);
+        });
+      }
+
+      function nextFrame(){
+        if (i >= times.length){ finishRefine(); return; }
+        el.elapsedBadge.textContent = "動きを解析中… " + Math.round(i / times.length * 100) + "%";
+        seekTo(times[i]).then(function(ok){
+          if (ok && el.video.readyState >= 2){
+            try{
+              var ts = Math.max(Math.round(performance.now()), lastTs + 1); lastTs = ts;
+              var r = state.poseLandmarker.detectForVideo(el.video, ts);
+              var lm = (r.landmarks && r.landmarks[0]) ? r.landmarks[0] : null;
+              var wlm = (r.worldLandmarks && r.worldLandmarks[0]) ? r.worldLandmarks[0] : null;
+              dense.push({ t: el.video.currentTime, landmarks: lm, worldLandmarks: wlm });
+            }catch(e){ /* このコマの検出失敗は飛ばす(ループは止めない) */ }
+          }
+          i++;
+          setTimeout(nextFrame, 0); // UIを固めないよう1コマずつ次のタスクへ
+        });
+      }
+
+      function finishRefine(){
+        el.elapsedBadge.hidden = true;
+        var denseValid = dense.filter(function(s){ return s.landmarks; }).length;
+        var liveValid = state.samples.filter(function(s){ return s.landmarks; }).length;
+        // 再解析の方が有効コマ数が多いときだけ採用する(ライブ検出より悪化させない)
+        if (dense.length >= 4 && denseValid >= liveValid){
+          state.samples = dense;
+          state.duration = dur;
+        }
+        try{ el.video.currentTime = 0; }catch(e){}
+        state.refining = false;
+        resolve();
+      }
+
+      nextFrame();
+    });
+  });
+}
+
+// video.durationがInfinity(Android Chromeのwebm/fMP4)のとき、大きな位置へ一度シークして実尺を確定させる定番の回避策。
+function resolveDuration(){
+  return new Promise(function(resolve){
+    var d = el.video.duration;
+    if (isFinite(d) && d > 0){ resolve(d); return; }
+    var done = false;
+    function finish(){
+      if (done) return; done = true;
+      el.video.removeEventListener("timeupdate", onTU);
+      var dd = el.video.duration;
+      if (!isFinite(dd) || dd <= 0) dd = state.samples.length ? state.samples[state.samples.length - 1].t : 0;
+      try{ el.video.currentTime = 0; }catch(e){}
+      resolve(dd);
+    }
+    function onTU(){ finish(); }
+    el.video.addEventListener("timeupdate", onTU);
+    try{ el.video.currentTime = 1e7; }catch(e){ finish(); return; }
+    setTimeout(finish, 1500);
+  });
 }
 
 function visOK(lm){ return !!lm && (lm.visibility === undefined || lm.visibility >= CONFIG.minVisibility); }
@@ -1036,20 +1151,70 @@ function resetApp(){
   el.phaseTrack.innerHTML = "";
   state.mode = "idle";
   state.samples = []; state.duration = 0; state.recording = false;
+  state.smoothLive = null; state.refining = false;
 }
 
 /* ==== 骨格オーバーレイ描画 ==== */
-function nearestSampleIndex(t){
+// 再生位置tを挟む前後2サンプルを見つけて、その時刻で線形補間した骨格を返す。
+// 「最も近い1コマ」を貼るのではなく前後を補間することで、スロー再生でも骨格が滑らかに動く。
+function sampleLandmarksAt(t){
   var samples = state.samples;
-  var lo = 0, hi = samples.length - 1;
-  if (t <= samples[0].t) return 0;
-  if (t >= samples[hi].t) return hi;
+  if (!samples.length) return null;
+  if (t <= samples[0].t) return samples[0].landmarks;
+  var last = samples.length - 1;
+  if (t >= samples[last].t) return samples[last].landmarks;
+  var lo = 0, hi = last;
   while (lo < hi){
     var mid = (lo + hi) >> 1;
     if (samples[mid].t < t) lo = mid + 1; else hi = mid;
   }
-  var a = Math.max(0, lo - 1), b = lo;
-  return (Math.abs(samples[a].t - t) <= Math.abs(samples[b].t - t)) ? a : b;
+  var b = lo, a = lo - 1;
+  var sa = samples[a].landmarks, sb = samples[b].landmarks;
+  if (!sa) return sb;
+  if (!sb) return sa;
+  var span = samples[b].t - samples[a].t;
+  var f = span > 0 ? (t - samples[a].t) / span : 0;
+  return lerpLandmarks(sa, sb, f);
+}
+
+function lerpLandmarks(a, b, f){
+  var n = Math.max(a.length, b.length);
+  var out = new Array(n);
+  for (var i = 0; i < n; i++){
+    var pa = a[i], pb = b[i];
+    if (!pa || !pb){ out[i] = pa || pb || null; continue; }
+    var va = (pa.visibility == null) ? 1 : pa.visibility;
+    var vb = (pb.visibility == null) ? 1 : pb.visibility;
+    out[i] = {
+      x: pa.x + (pb.x - pa.x) * f,
+      y: pa.y + (pb.y - pa.y) * f,
+      z: (pa.z || 0) + ((pb.z || 0) - (pa.z || 0)) * f,
+      visibility: Math.min(va, vb) // どちらかが不確かなら描かない側に倒す
+    };
+  }
+  return out;
+}
+
+// ライブ表示のちらつき低減。指数移動平均で骨格を追従させる(表示専用。解析用サンプルには一切影響しない)。
+function smoothLiveLandmarks(lm){
+  if (!lm) return state.smoothLive; // 一瞬検出が抜けても直前の骨格を残す
+  var prev = state.smoothLive;
+  if (!prev || prev.length !== lm.length){
+    state.smoothLive = lm.map(function(p){ return p ? { x:p.x, y:p.y, z:p.z||0, visibility:p.visibility } : null; });
+    return state.smoothLive;
+  }
+  var a = 0.55; // 大きいほど追従が速く、小さいほど滑らか
+  for (var i = 0; i < lm.length; i++){
+    var p = lm[i];
+    if (!p) continue; // このコマで欠けた点は直前値を維持
+    var q = prev[i];
+    if (!q){ prev[i] = { x:p.x, y:p.y, z:p.z||0, visibility:p.visibility }; continue; }
+    q.x += (p.x - q.x) * a;
+    q.y += (p.y - q.y) * a;
+    q.z += ((p.z || 0) - q.z) * a;
+    q.visibility = p.visibility;
+  }
+  return prev;
 }
 
 function drawOverlay(){
@@ -1057,13 +1222,14 @@ function drawOverlay(){
   ctx.clearRect(0, 0, w, h);
   var lm = null;
   if (state.mode === "live"){
-    lm = state.liveLandmarks;
+    lm = smoothLiveLandmarks(state.liveLandmarks);
   } else if (state.mode === "playback" && state.samples.length){
-    var idx = nearestSampleIndex(el.video.currentTime);
-    lm = state.samples[idx].landmarks;
+    lm = sampleLandmarksAt(el.video.currentTime);
   }
   if (!lm) return;
 
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round"; // 関節の折れ目・線端を丸くして骨格を滑らかに見せる
   ctx.strokeStyle = "#c5303a";
   ctx.lineWidth = 3;
   CONNECTIONS.forEach(function(pair){
@@ -1075,12 +1241,17 @@ function drawOverlay(){
     ctx.stroke();
   });
   ctx.fillStyle = "#fbfbf7";
-  Object.keys(LM).forEach(function(key){
-    var p = lm[LM[key]];
+  ctx.strokeStyle = "rgba(197,48,58,.9)";
+  ctx.lineWidth = 1.5;
+  DRAW_POINTS.forEach(function(idx){
+    var p = lm[idx];
     if (!visOK(p)) return;
+    // 手・足先(17以降)は細かい点なので少し小さく描く
+    var r = idx >= 17 ? 3 : 4;
     ctx.beginPath();
-    ctx.arc(p.x * w, p.y * h, 4, 0, Math.PI * 2);
+    ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
     ctx.fill();
+    ctx.stroke();
   });
 }
 </script>

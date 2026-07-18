@@ -368,17 +368,30 @@ async function startCamera(){
     showStartError("解析モデルの読み込みが完了していません。少し待ってから再度お試しください。");
     return;
   }
+  if (!window.isSecureContext){
+    showStartError("このページが安全な接続(HTTPS)で開かれていないため、カメラを使えません。https:// で始まるアドレスで開き直してください(GitHub Pagesのアドレスは https で始まります)。");
+    return;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    showStartError("このブラウザ・環境ではカメラ機能が使えません。HTTPS配信のページで開いているか確認してください。");
+    showStartError("このブラウザ・環境ではカメラ機能が使えません。LINEやX(旧Twitter)などのアプリ内ブラウザではなく、Chromeなど通常のブラウザで開いてください。");
     return;
   }
   state.startingCamera = true;
   el.btnStartCamera.disabled = true;
+  var stream = null;
   try{
-    var stream = await navigator.mediaDevices.getUserMedia({
+    // カメラ取得と映像表示は分けて扱う。取得失敗(権限など)と表示失敗(再生)を取り違えないため。
+    stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: false
     });
+  }catch(e){
+    showStartError(cameraErrorMessage(e));
+    state.startingCamera = false;
+    el.btnStartCamera.disabled = false;
+    return;
+  }
+  try{
     state.liveStream = stream;
     el.liveError.hidden = true;
     var swInput = parseFloat(el.shoulderWidthInput.value);
@@ -402,11 +415,28 @@ async function startCamera(){
     state.mode = "live";
     startLiveLoop();
   }catch(e){
-    showStartError("カメラを起動できませんでした。カメラの利用許可、HTTPS配信(またはlocalhost)であることを確認してください。(" + (e && e.message ? e.message : e) + ")");
+    if (stream){ stream.getTracks().forEach(function(tr){ tr.stop(); }); state.liveStream = null; }
+    showStartError("カメラ映像の表示を開始できませんでした。ページを再読み込みしてもう一度お試しください。(" + (e && e.message ? e.message : e) + ")");
   }finally{
     state.startingCamera = false;
     el.btnStartCamera.disabled = false;
   }
+}
+
+// getUserMediaの失敗理由を原因別にわかりやすい日本語にする(特にAndroidで多い権限・アプリ内ブラウザを案内)
+function cameraErrorMessage(e){
+  var name = e && e.name ? e.name : "";
+  var detail = e && e.message ? e.message : ("" + e);
+  if (name === "NotAllowedError" || name === "SecurityError"){
+    return "カメラの使用が許可されませんでした。次を確認してください: ①許可を求められたら「許可」を選ぶ ②一度「ブロック」した場合は、アドレスバーの鍵(またはⓘ)アイコン→「サイトの設定/権限」→カメラ を「許可」に変更 ③LINEやXなどのアプリ内ブラウザでは使えないことがあるので、Chromeなど通常のブラウザで開く。(" + name + ")";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError"){
+    return "背面カメラを見つけられませんでした。カメラを搭載した端末で、Chromeなど通常のブラウザで開いているか確認してください。(" + name + ")";
+  }
+  if (name === "NotReadableError" || name === "AbortError"){
+    return "カメラを開けませんでした。他のアプリ(カメラ・ビデオ通話など)がカメラを使用中の場合は、それを閉じてからもう一度お試しください。(" + name + ")";
+  }
+  return "カメラを起動できませんでした。カメラの利用許可と、Chromeなど通常のブラウザ・HTTPSで開いていることを確認してください。(" + (name || detail) + ")";
 }
 
 function fitCanvas(){

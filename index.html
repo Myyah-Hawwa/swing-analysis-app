@@ -124,9 +124,16 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
   </div>
 
   <section id="panelStart" class="panel">
-    <p class="lead">スマートフォンのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。</p>
+    <p class="lead" id="startLead">スマートフォンのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。</p>
+    <div class="field-row">
+      <label>撮影アングル</label>
+      <div class="speed-seg" id="viewSeg" style="flex:1 1 auto;min-width:220px;">
+        <button type="button" class="seg-btn active" data-view="rear">背面(捕手側)</button>
+        <button type="button" class="seg-btn" data-view="side">側面(真横)</button>
+      </div>
+    </div>
     <ul class="hint-list">
-      <li>撮影は<b>捕手側・打者の背後</b>から。打者の背中越しに投手方向を見る構図にしてください</li>
+      <li id="hintAngle">撮影は<b>捕手側・打者の背後</b>から。打者の背中越しに投手方向を見る構図にしてください</li>
       <li>打者一人が画面の大部分を占めるように。他の人が大きく写り込むと誤検出します</li>
       <li>逆光を避け、できるだけ明るい場所で撮影してください</li>
       <li>カメラ映像は端末の外へ送信されません(解析はすべてこのブラウザの中で行われます)</li>
@@ -181,7 +188,7 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
     </div>
     <p class="fine-print">
       判定は単眼カメラの2D映像からの<b>推定値</b>です。撮影角度・明るさ・映り込みで数値は変動します。最終的な判断はご自身の目で確認してください。<br>
-      背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。<br>
+      <span id="finePrintHead">背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。</span><br>
       スピードは手首の動きから推定した<b>手元の速さ</b>であり、バットは検出していません。バット先端の実速度とは異なります。解析モデルが画像から推定する3D身体モデルを、入力した肩幅で補正して換算するため、肩幅の入力値の正確さが推定精度に直結します。<br>
       録画は最大<span id="finePrintMaxSec"></span>秒で自動停止します。判定基準の数値はコード先頭の CONFIG に集約されています。現場の感覚に合わせて書き換えてください。
     </p>
@@ -228,6 +235,10 @@ var DRAW_POINTS = [0,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,2
 var el = {
   statusBadge: document.getElementById("statusBadge"),
   panelStart: document.getElementById("panelStart"),
+  startLead: document.getElementById("startLead"),
+  viewSeg: document.getElementById("viewSeg"),
+  hintAngle: document.getElementById("hintAngle"),
+  finePrintHead: document.getElementById("finePrintHead"),
   btnStartCamera: document.getElementById("btnStartCamera"),
   shoulderWidthInput: document.getElementById("shoulderWidthInput"),
   startError: document.getElementById("startError"),
@@ -266,6 +277,7 @@ var state = {
   recordingGen: 0,     // 録画セッションの世代。古い録画のonstop/onerrorが新しい録画を汚染しないためのガード
   currentVideoUrl: null, // 再生用Blob URL(撮り直し時にrevokeするため保持)
   shoulderWidthCm: 38, // カメラ起動時点の入力値をスナップショット(録画中に入力欄が変わっても解析には影響させない)
+  viewMode: "rear",    // 撮影アングル(rear=背面/side=側面)。カメラ起動時点で確定させ、解析ロジックを切り替える
   samples: [],        // [{t, landmarks, worldLandmarks}] (t: 秒)
   duration: 0,
   rafId: null,
@@ -319,6 +331,36 @@ function showLiveError(msg){ el.liveError.hidden = false; el.liveError.textConte
 el.btnStartCamera.addEventListener("click", startCamera);
 window.__appBooted = true; // モジュール読み込み失敗検知用(下部の非モジュールscriptから参照)
 
+/* ==== 撮影アングル(背面/側面)の選択 ==== */
+var VIEW_TEXT = {
+  rear: {
+    lead: "スマートフォンのカメラで、背面(捕手側)から打者の後ろ姿を撮影しながらリアルタイムで解析します。",
+    hint: '撮影は<b>捕手側・打者の背後</b>から。打者の背中越しに投手方向を見る構図にしてください',
+    finePrintHead: "背面からの撮影のため、顔(鼻)は映らない前提で<b>両耳の中心</b>を頭部の基準点として使っています。"
+  },
+  side: {
+    lead: "スマートフォンのカメラで、真横(打者の顔側)から打者を撮影しながらリアルタイムで解析します。",
+    hint: '撮影は<b>打者の真横</b>から(右打者は三塁側、左打者は一塁側が顔側)。スイングの面が横から見える構図にしてください',
+    finePrintHead: "側面からの撮影では、顔が見える前提で<b>鼻</b>を頭部の基準点として使っています。体の向き(回転)は3D姿勢推定から算出します。"
+  }
+};
+var currentView = "rear";
+function applyViewText(v){
+  var t = VIEW_TEXT[v] || VIEW_TEXT.rear;
+  if (el.startLead) el.startLead.innerHTML = t.lead;
+  if (el.hintAngle) el.hintAngle.innerHTML = t.hint;
+}
+if (el.viewSeg){
+  el.viewSeg.querySelectorAll(".seg-btn").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      el.viewSeg.querySelectorAll(".seg-btn").forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+      currentView = btn.dataset.view === "side" ? "side" : "rear";
+      applyViewText(currentView);
+    });
+  });
+}
+
 async function startCamera(){
   el.startError.hidden = true;
   if (state.startingCamera) return; // 連打によるgetUserMedia多重起動・ストリームリークを防ぐ
@@ -342,6 +384,7 @@ async function startCamera(){
     var swInput = parseFloat(el.shoulderWidthInput.value);
     if (!(swInput > 0)) swInput = 38;
     state.shoulderWidthCm = Math.max(15, Math.min(60, swInput)); // 録画開始時点の値をスナップショット
+    state.viewMode = currentView; // 撮影アングルもこの時点で確定(録画〜解析で一貫させる)
     var track = stream.getVideoTracks()[0];
     if (track){
       track.addEventListener("ended", function(){
@@ -717,6 +760,12 @@ function buildSeries(samples){
   // 断定できるほどの確証がないため、角度計算はここでは切り替えない。
   var shoulderAngle = new Array(n).fill(null);
   var hipAngle = new Array(n).fill(null);
+  // 側面撮影用: ワールド座標の水平面(x-z)における肩ライン・骨盤ラインのヨー角(体の向き)。
+  // カメラの方位ぶんの定数オフセットが乗るが、回転開始は角速度で判定するためオフセットは相殺され、
+  // 背面でも側面でも同じ物理量(鉛直軸まわりの回転)として使える。背面は従来どおり2D画像角を使う。
+  var shoulderYaw = new Array(n).fill(null);
+  var hipYaw = new Array(n).fill(null);
+  var useNose = (state.viewMode === "side"); // 側面は顔が見えるので鼻を頭部基準にする(背面は両耳の中心)
   // 頭部・手首の位置と肩幅は、画像縦横比や体の向きの影響を受けない3Dワールド座標(メートル単位)で計算する
   var headWX = new Array(n).fill(null), headWY = new Array(n).fill(null), headWZ = new Array(n).fill(null);
   var wristWX = new Array(n).fill(null), wristWY = new Array(n).fill(null), wristWZ = new Array(n).fill(null);
@@ -735,19 +784,27 @@ function buildSeries(samples){
     if (!wlm) continue;
     worldValidCount++;
     var wls = wlm[LM.lShoulder], wrs = wlm[LM.rShoulder];
-    var wle = wlm[LM.lEar], wre = wlm[LM.rEar];
+    var wlh = wlm[LM.lHip], wrh = wlm[LM.rHip];
+    var wle = wlm[LM.lEar], wre = wlm[LM.rEar], wn = wlm[LM.nose];
     var wlw = wlm[LM.lWrist], wrw = wlm[LM.rWrist];
     if (visOK(wls) && visOK(wrs)) shoulderWidthM[i] = dist3D(wls, wrs);
-    // 背面からの撮影のため顔(鼻)は写らない前提。両耳の中心を頭部位置の代わりに使う
-    if (visOK(wle) && visOK(wre)){ headWX[i] = (wle.x + wre.x) / 2; headWY[i] = (wle.y + wre.y) / 2; headWZ[i] = (wle.z + wre.z) / 2; }
+    // ヨー角は側面撮影で遠側の肩・腰が隠れて可視度が下がりがちなため、可視度でなくワールド座標の
+    // 有無で判定する(worldLandmarksはモデルの体格プリオルにより隠れた関節も3D位置を推定するため)。
+    if (wls && wrs) shoulderYaw[i] = Math.atan2(wrs.z - wls.z, wrs.x - wls.x) * 180 / Math.PI;
+    if (wlh && wrh) hipYaw[i] = Math.atan2(wrh.z - wlh.z, wrh.x - wlh.x) * 180 / Math.PI;
+    // 頭部基準点: 側面は鼻、背面は両耳の中心(鼻が見えないため)。取れなければ片耳→鼻の順で代用する
+    if (useNose && visOK(wn)){ headWX[i] = wn.x; headWY[i] = wn.y; headWZ[i] = wn.z; }
+    else if (visOK(wle) && visOK(wre)){ headWX[i] = (wle.x + wre.x) / 2; headWY[i] = (wle.y + wre.y) / 2; headWZ[i] = (wle.z + wre.z) / 2; }
     else if (visOK(wle)){ headWX[i] = wle.x; headWY[i] = wle.y; headWZ[i] = wle.z; }
     else if (visOK(wre)){ headWX[i] = wre.x; headWY[i] = wre.y; headWZ[i] = wre.z; }
+    else if (visOK(wn)){ headWX[i] = wn.x; headWY[i] = wn.y; headWZ[i] = wn.z; }
     if (visOK(wlw) && visOK(wrw)){ wristWX[i] = (wlw.x + wrw.x) / 2; wristWY[i] = (wlw.y + wrw.y) / 2; wristWZ[i] = (wlw.z + wrw.z) / 2; }
     else if (visOK(wlw)){ wristWX[i] = wlw.x; wristWY[i] = wlw.y; wristWZ[i] = wlw.z; }
     else if (visOK(wrw)){ wristWX[i] = wrw.x; wristWY[i] = wrw.y; wristWZ[i] = wrw.z; }
   }
   return {
     shoulderAngle: shoulderAngle, hipAngle: hipAngle,
+    shoulderYaw: shoulderYaw, hipYaw: hipYaw,
     headWX: headWX, headWY: headWY, headWZ: headWZ,
     wristWX: wristWX, wristWY: wristWY, wristWZ: wristWZ,
     shoulderWidthM: shoulderWidthM,
@@ -798,6 +855,16 @@ function findRotationStart(angVel, peakIdx){
 
 function finishAnalysis(){
   el.phaseTrack.innerHTML = ""; // 前回の解析結果のピンが残らないよう、分岐に入る前に必ずクリアする
+  var side = (state.viewMode === "side");
+  // 結果画面の注記(頭部の基準点)を撮影アングルに合わせて更新
+  if (el.finePrintHead) el.finePrintHead.innerHTML = (VIEW_TEXT[state.viewMode] || VIEW_TEXT.rear).finePrintHead;
+  // 頭の動きの見出し・文言(側面=前後の突っ込みが主眼、背面=左右のブレが主眼)
+  var headTitle = side ? "頭の前後(突っ込み)・上下の動き(鼻)" : "頭の水平・上下のブレ(両耳の中心)";
+  var headRefWord = side ? "頭部(鼻)" : "頭部(両耳の中心)";
+  var headNaDetail = side
+    ? "鼻または肩を十分に検出できなかったため、頭の動きは計測できませんでした。"
+    : "両耳または肩を十分に検出できなかったため、頭部のブレは計測できませんでした。";
+  var rotNote = side ? " (側面撮影のため、体の向きの回転は3D姿勢推定から算出しています。)" : "";
   var samples = state.samples;
   if (samples.length < 4){
     el.checklist.innerHTML = "";
@@ -842,8 +909,11 @@ function finishAnalysis(){
     return;
   }
 
-  var hipMissing = allNull(series.hipAngle);
-  var shoulderMissing = allNull(series.shoulderAngle);
+  // 回転計測に使う角度系列: 側面はワールド座標のヨー角、背面は2D画像角(検証済みの従来ロジックを維持)
+  var hipRotSeries = side ? series.hipYaw : series.hipAngle;
+  var shoulderRotSeries = side ? series.shoulderYaw : series.shoulderAngle;
+  var hipMissing = allNull(hipRotSeries);
+  var shoulderMissing = allNull(shoulderRotSeries);
   if (hipMissing && shoulderMissing){
     el.checklist.innerHTML = "";
     var noRot = document.createElement("li");
@@ -861,11 +931,11 @@ function finishAnalysis(){
 
   var hipStartIdx = null, shoulderStartIdx = null;
   if (!hipMissing){
-    var hipAngle = smoothAngle(interpolateAngleNulls(series.hipAngle), CONFIG.smoothWindow);
+    var hipAngle = smoothAngle(interpolateAngleNulls(hipRotSeries), CONFIG.smoothWindow);
     hipStartIdx = findRotationStart(angularVelSeries(hipAngle, ts), impactIdx);
   }
   if (!shoulderMissing){
-    var shoulderAngle = smoothAngle(interpolateAngleNulls(series.shoulderAngle), CONFIG.smoothWindow);
+    var shoulderAngle = smoothAngle(interpolateAngleNulls(shoulderRotSeries), CONFIG.smoothWindow);
     shoulderStartIdx = findRotationStart(angularVelSeries(shoulderAngle, ts), impactIdx);
   }
   var rotationStartIdx = !hipMissing && !shoulderMissing ? Math.min(hipStartIdx, shoulderStartIdx)
@@ -901,16 +971,16 @@ function finishAnalysis(){
 
   if (allNull(series.headWX) || !refShoulderWidthM){
     checklistItems.push({
-      title: "頭の水平・上下のブレ(両耳の中心)",
+      title: headTitle,
       verdict: "na",
-      detail: "両耳または肩を十分に検出できなかったため、頭部のブレは計測できませんでした。",
+      detail: headNaDetail,
       jumps: []
     });
   } else if (!timingReliable){
     checklistItems.push({
-      title: "頭の水平・上下のブレ(両耳の中心)",
+      title: headTitle,
       verdict: "na",
-      detail: "回転開始とインパクトの区別がつかず、頭部のブレは計測できませんでした。もう少し長めに撮影してください。",
+      detail: "回転開始とインパクトの区別がつかず、頭の動きは計測できませんでした。もう少し長めに撮影してください。",
       jumps: []
     });
   } else {
@@ -923,9 +993,9 @@ function finishAnalysis(){
     );
     var wobbleRatio = headDisp / refShoulderWidthM;
     checklistItems.push({
-      title: "頭の水平・上下のブレ(両耳の中心)",
+      title: headTitle,
       verdict: wobbleRatio <= CONFIG.headWobble.goodMax ? "ok" : (wobbleRatio <= CONFIG.headWobble.okMax ? "mid" : "ng"),
-      detail: "回転開始からインパクトまでの頭部(両耳の中心)の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)"
+      detail: "回転開始からインパクトまでの" + headRefWord + "の移動量は、肩幅の約 " + Math.round(wobbleRatio*100) + "% でした。(目安: 良好 " + Math.round(CONFIG.headWobble.goodMax*100) + "%以下 / 要注意 " + Math.round(CONFIG.headWobble.okMax*100) + "%超)"
         + " この目安は奥行きを含む3D計測に切り替えた後まだ実データで検証していません。判定に違和感があれば数値だけ参考にし、コード先頭のCONFIG.headWobbleを実際の見え方に合わせて調整してください。",
       jumps: [
         { label: "回転開始を見る", t: ts[rotationStartIdx] },
@@ -946,7 +1016,7 @@ function finishAnalysis(){
     checklistItems.push({
       title: "回転の順序(骨盤が肩より先行しているか)",
       verdict: leadMs >= CONFIG.rotationLead.goodLeadMs ? "ok" : (leadMs >= CONFIG.rotationLead.okLeadMs ? "mid" : "ng"),
-      detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)" + samplingNote,
+      detail: "骨盤の回転開始は、肩の回転開始より " + Math.round(leadMs) + "ms " + (leadMs >= 0 ? "早く" : "遅く") + "検出されました。(骨盤が先行するほど良いとされます)" + samplingNote + rotNote,
       jumps: [
         { label: "骨盤の始動を見る", t: ts[hipStartIdx] },
         { label: "肩の始動を見る", t: ts[shoulderStartIdx] }

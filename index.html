@@ -82,6 +82,8 @@ h2{font-size:.92rem;margin:0 0 10px;font-weight:800;color:var(--ink);}
 .detect-dot{position:absolute;top:10px;right:10px;width:14px;height:14px;border-radius:50%;background:rgba(255,255,255,.35);border:2px solid rgba(255,255,255,.6);transition:background .15s;}
 .detect-dot.active{background:var(--ok);border-color:#fff;}
 .elapsed-badge{position:absolute;top:10px;left:10px;font-size:.76rem;font-weight:800;color:#fff;background:rgba(0,0,0,.45);border-radius:99px;padding:4px 10px;}
+.select-prompt{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);max-width:92%;text-align:center;font-size:.86rem;font-weight:800;color:#fff;background:rgba(27,42,74,.82);border-radius:10px;padding:9px 14px;pointer-events:none;line-height:1.4;}
+#stage{cursor:pointer;}
 
 .scrub-wrap{margin:6px 0 14px;}
 input[type="range"]{width:100%;accent-color:var(--ink);}
@@ -154,12 +156,16 @@ input[type="range"]{width:100%;accent-color:var(--ink);}
       <canvas id="overlayCanvas"></canvas>
       <div class="detect-dot" id="detectDot"></div>
       <div class="elapsed-badge" id="elapsedBadge" hidden></div>
+      <div class="select-prompt" id="selectPrompt" hidden></div>
     </div>
   </div>
 
   <section id="panelLive" class="panel" hidden>
-    <p class="lead" id="liveLabel">打者と骨格線が映ったら、構えのタイミングで録画を開始してください。</p>
-    <button type="button" class="btn btn-record" id="btnRecord">録画開始</button>
+    <p class="lead" id="liveLabel">解析する選手に骨格線が重なったら、構えのタイミングで録画を開始してください。複数人が写るときは、解析したい選手を画面でタップして選べます。</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-record" id="btnRecord" style="flex:2 1 auto;">録画開始</button>
+      <button type="button" class="btn btn-ghost" id="btnReselect" style="flex:1 1 auto;">選手を選び直す</button>
+    </div>
     <p id="liveError" class="error-text" hidden></p>
   </section>
 
@@ -213,7 +219,9 @@ var CONFIG = {
   rotationLead: { goodLeadMs: 60, okLeadMs: 0 }, // 骨盤が肩より何ms早く回り始めれば良いか
   angularVelThresholdRatio: 0.15,  // 回転「開始」とみなす、ピーク角速度に対する比率
   stepFallbackSec: 1/30,           // コマ送りボタンの移動量(秒、再生時)
-  speedSanity: { minKmh: 5, maxKmh: 90 } // 手元(グリップ)速度の妥当範囲。バット先端速度ではない点に注意。外れたら信頼せず「不明」扱いにする
+  speedSanity: { minKmh: 5, maxKmh: 90 }, // 手元(グリップ)速度の妥当範囲。バット先端速度ではない点に注意。外れたら信頼せず「不明」扱いにする
+  maxPeople: 3,                    // 同時に検出する人数の上限(複数人が写っても選手を選べるように)。多いほど重い
+  trackGate: 0.22                  // 選択選手の追跡許容距離(画面幅に対する胴中心の移動量)。これを超えたら見失い扱い
 };
 
 var LM = { nose:0, lEar:7, rEar:8, lShoulder:11, rShoulder:12, lElbow:13, rElbow:14, lWrist:15, rWrist:16, lHip:23, rHip:24, lKnee:25, rKnee:26, lAnkle:27, rAnkle:28 };
@@ -244,11 +252,15 @@ var el = {
   startError: document.getElementById("startError"),
   stageWrap: document.getElementById("stageWrap"),
   video: document.getElementById("video"),
+  stage: document.getElementById("stage"),
   canvas: document.getElementById("overlayCanvas"),
   detectDot: document.getElementById("detectDot"),
   elapsedBadge: document.getElementById("elapsedBadge"),
+  selectPrompt: document.getElementById("selectPrompt"),
   panelLive: document.getElementById("panelLive"),
+  liveLabel: document.getElementById("liveLabel"),
   btnRecord: document.getElementById("btnRecord"),
+  btnReselect: document.getElementById("btnReselect"),
   liveError: document.getElementById("liveError"),
   panelResult: document.getElementById("panelResult"),
   btnPlayPause: document.getElementById("btnPlayPause"),
@@ -268,7 +280,6 @@ var state = {
   poseLandmarker: null,
   mode: "idle",       // idle | live | playback
   liveStream: null,
-  liveLandmarks: null,
   liveBusy: false,
   startingCamera: false,
   recording: false,
@@ -283,7 +294,10 @@ var state = {
   rafId: null,
   transportReady: false,
   smoothLive: null,    // ライブ表示のちらつきを抑えるための平滑化済み骨格(表示専用。解析用サンプルには使わない)
-  refining: false      // 撮影後の密再解析(コマ送り検出)の実行中フラグ
+  refining: false,     // 撮影後の密再解析(コマ送り検出)の実行中フラグ
+  liveAllLandmarks: null, // 現フレームで検出した全員の2Dランドマーク(選手選択・全員描画用)
+  target: null,        // 追跡中の選手の胴中心(正規化座標 {x,y,ok})。これに最も近い人を毎コマ選手として拾う
+  selectedIdx: -1      // 現フレームで選手と判定した人物の配列インデックス(-1=未選択/見失い)
 };
 
 // 録画中・プレビュー中にタブがバックグラウンド化したら、気づかないまま録画が続くのを防ぐため録画を打ち切る
@@ -313,13 +327,13 @@ async function initPoseLandmarker(){
     return await PoseLandmarker.createFromOptions(vision, {
       baseOptions: { modelAssetPath: modelUrl, delegate: "GPU" },
       runningMode: "VIDEO",
-      numPoses: 1
+      numPoses: CONFIG.maxPeople // 複数人を検出して、解析する選手を選べるようにする
     });
   }catch(e){
     return await PoseLandmarker.createFromOptions(vision, {
       baseOptions: { modelAssetPath: modelUrl, delegate: "CPU" },
       runningMode: "VIDEO",
-      numPoses: 1
+      numPoses: CONFIG.maxPeople
     });
   }
 }
@@ -448,24 +462,89 @@ function fitCanvas(){
 }
 window.addEventListener("resize", fitCanvas);
 
+/* ==== 複数人の中から解析する選手を選ぶ・追跡する ==== */
+// 胴の中心(両肩・両腰の見えている点の平均)を正規化座標で返す。人物の位置の代表点。
+function poseAnchor(lm){
+  if (!lm) return { x:0, y:0, ok:false };
+  var idxs = [LM.lShoulder, LM.rShoulder, LM.lHip, LM.rHip];
+  var sx=0, sy=0, c=0;
+  for (var k=0;k<idxs.length;k++){ var p=lm[idxs[k]]; if (visOK(p)){ sx+=p.x; sy+=p.y; c++; } }
+  if (c) return { x:sx/c, y:sy/c, ok:true };
+  var nose = lm[LM.nose];
+  if (visOK(nose)) return { x:nose.x, y:nose.y, ok:true };
+  return { x:0, y:0, ok:false };
+}
+// 画面内での体の大きさ(肩幅、正規化)。手前=大きく写る人ほど大きい。既定選手の選択に使う。
+function poseSize(lm){
+  var ls=lm[LM.lShoulder], rs=lm[LM.rShoulder];
+  if (visOK(ls) && visOK(rs)) return Math.hypot(ls.x-rs.x, ls.y-rs.y);
+  var lh=lm[LM.lHip], rh=lm[LM.rHip];
+  if (visOK(lh) && visOK(rh)) return Math.hypot(lh.x-rh.x, lh.y-rh.y);
+  return 0;
+}
+// target(前コマの胴中心)に最も近い人物のインデックスと距離を返す
+function pickNearestPose(poses, target){
+  var best=-1, bestD=Infinity;
+  for (var i=0;i<poses.length;i++){
+    var a=poseAnchor(poses[i]); if (!a.ok) continue;
+    var d=Math.hypot(a.x-target.x, a.y-target.y);
+    if (d<bestD){ bestD=d; best=i; }
+  }
+  return { idx:best, dist:bestD };
+}
+// 最も大きく写っている(手前の)人物。選択されないまま録画したときの既定選手。
+function pickLargestPose(poses){
+  var best=-1, bestS=-1;
+  for (var i=0;i<poses.length;i++){ var s=poseSize(poses[i]); if (s>bestS){ bestS=s; best=i; } }
+  return best;
+}
+// 複数人が写っていて、まだ選手が定まっていないときだけ「タップして選んで」を表示する
+function updateSelectPrompt(count, selIdx){
+  if (!el.selectPrompt) return;
+  var show = (!state.recording && count > 1 && selIdx < 0);
+  el.selectPrompt.hidden = !show;
+  if (show) el.selectPrompt.textContent = "解析する選手をタップして選んでください";
+}
+
 /* ==== ライブ検出ループ(録画前のプレビュー中も、録画中も動く) ==== */
 function startLiveLoop(){
   cancelAnimationFrame(state.rafId);
   state.smoothLive = null; // 新しいライブセッションでは平滑化をリセット
+  state.target = null; state.selectedIdx = -1; state.liveAllLandmarks = null;
   function tick(){
     if (!state.liveBusy && state.poseLandmarker && el.video.readyState >= 2){
       state.liveBusy = true;
       try{
         var ts = performance.now();
         var result = state.poseLandmarker.detectForVideo(el.video, Math.round(ts));
-        var lm = (result.landmarks && result.landmarks[0]) ? result.landmarks[0] : null;
+        var poses = (result && result.landmarks) ? result.landmarks : [];
         // worldLandmarks: 両股関節の中点を原点とした実メートル単位の3D座標。距離・速度の計算はこちらを使う
-        var wlm = (result.worldLandmarks && result.worldLandmarks[0]) ? result.worldLandmarks[0] : null;
-        state.liveLandmarks = lm;
-        el.detectDot.classList.toggle("active", !!lm);
+        var wposes = (result && result.worldLandmarks) ? result.worldLandmarks : [];
+        state.liveAllLandmarks = poses;
+
+        // 追跡: targetに最も近い人物を選手とみなす。未設定で1人だけなら自動選択、複数なら選択待ち。
+        // targetには必ず有効な胴中心(ok=true)だけを入れる。ok=falseを入れると{0,0}に固着して二度と捕捉できなくなるため。
+        var selIdx = -1;
+        if (poses.length){
+          if (!state.target && poses.length === 1){ var a0 = poseAnchor(poses[0]); if (a0.ok) state.target = a0; }
+          if (state.target){
+            var pick = pickNearestPose(poses, state.target);
+            if (pick.idx >= 0 && pick.dist <= CONFIG.trackGate){
+              selIdx = pick.idx;
+              var na = poseAnchor(poses[selIdx]); if (na.ok) state.target = na; // 追従して更新
+            }
+          }
+        }
+        state.selectedIdx = selIdx;
+        if (selIdx < 0) state.smoothLive = null; // 見失い中は平滑化を切り、再捕捉時にジャンプさせない
+        var lm = selIdx >= 0 ? poses[selIdx] : null;
+        var wlm = selIdx >= 0 ? wposes[selIdx] : null;
+        el.detectDot.classList.toggle("active", selIdx >= 0);
+        updateSelectPrompt(poses.length, selIdx);
+
         if (state.recording){
           var tSec = (ts - state.recordStartTs) / 1000;
-          state.samples.push({ t: tSec, landmarks: lm, worldLandmarks: wlm });
+          state.samples.push({ t: tSec, landmarks: lm, worldLandmarks: wlm }); // 選択選手のみ記録する
           el.elapsedBadge.textContent = tSec.toFixed(1) + "s / " + CONFIG.maxRecordSec.toFixed(1) + "s";
           if (tSec >= CONFIG.maxRecordSec) stopRecording();
         }
@@ -485,11 +564,36 @@ function startLiveLoop(){
   tick();
 }
 
+// 画面タップで解析する選手を選ぶ(タップ位置に最も近い人物をtargetにする)
+el.stage.addEventListener("click", function(e){
+  if (state.mode !== "live" || state.recording) return; // 録画中は対象を変えない(サンプルの取り違え防止)
+  var poses = state.liveAllLandmarks;
+  if (!poses || !poses.length) return;
+  var rect = el.stage.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  var nx = (e.clientX - rect.left) / rect.width;
+  var ny = (e.clientY - rect.top) / rect.height;
+  var pick = pickNearestPose(poses, { x:nx, y:ny });
+  if (pick.idx >= 0){
+    var ta = poseAnchor(poses[pick.idx]);
+    if (ta.ok){ state.target = ta; state.selectedIdx = pick.idx; state.smoothLive = null; } // 別人に切り替わるので平滑化をリセット
+  }
+});
+el.btnReselect.addEventListener("click", function(){
+  if (state.recording) return; // 録画中は選び直し不可(対象がぶれるのを防ぐ)
+  state.target = null; state.selectedIdx = -1; state.smoothLive = null;
+});
+
 el.btnRecord.addEventListener("click", function(){
   if (!state.recording) startRecording(); else stopRecording();
 });
 
 function startRecording(){
+  // 選手が未選択のまま録画開始したら、最も大きく写っている(手前の)人物を既定で選ぶ
+  if (!state.target && state.liveAllLandmarks && state.liveAllLandmarks.length){
+    var li = pickLargestPose(state.liveAllLandmarks);
+    if (li >= 0){ var la = poseAnchor(state.liveAllLandmarks[li]); if (la.ok){ state.target = la; state.smoothLive = null; } }
+  }
   var candidates = ["video/mp4;codecs=h264", "video/mp4", "video/webm;codecs=vp8", "video/webm"];
   var mimeType = candidates.find(function(m){ return window.MediaRecorder && MediaRecorder.isTypeSupported(m); }) || "";
 
@@ -561,6 +665,7 @@ function onRecordingFinished(myGen, chunks, recorder){
   el.panelLive.hidden = true;
   el.elapsedBadge.hidden = true;
   el.detectDot.classList.remove("active");
+  if (el.selectPrompt) el.selectPrompt.hidden = true;
   el.btnRecord.disabled = false;
   el.btnRecord.textContent = "録画開始";
 
@@ -641,6 +746,11 @@ function refineSamplesOffline(){
       var dense = [];
       var lastTs = Math.round(performance.now());   // VIDEOモードは単調増加タイムスタンプが必要
       var i = 0;
+      // 密再解析でも「録画時に選んだ選手」を追い続けるためのシード。ライブ検出で最初に選手が写ったコマの胴中心を使う。
+      var refineTarget = { x:0.5, y:0.5, ok:true };
+      for (var si = 0; si < state.samples.length; si++){
+        if (state.samples[si].landmarks){ var sa0 = poseAnchor(state.samples[si].landmarks); if (sa0.ok) refineTarget = sa0; break; }
+      }
       el.video.pause();
       el.elapsedBadge.hidden = false;
 
@@ -663,8 +773,16 @@ function refineSamplesOffline(){
             try{
               var ts = Math.max(Math.round(performance.now()), lastTs + 1); lastTs = ts;
               var r = state.poseLandmarker.detectForVideo(el.video, ts);
-              var lm = (r.landmarks && r.landmarks[0]) ? r.landmarks[0] : null;
-              var wlm = (r.worldLandmarks && r.worldLandmarks[0]) ? r.worldLandmarks[0] : null;
+              var poses = (r && r.landmarks) ? r.landmarks : [];
+              var wposes = (r && r.worldLandmarks) ? r.worldLandmarks : [];
+              var lm = null, wlm = null;
+              if (poses.length){
+                var pick = pickNearestPose(poses, refineTarget);
+                if (pick.idx >= 0 && pick.dist <= CONFIG.trackGate){
+                  lm = poses[pick.idx]; wlm = wposes[pick.idx];
+                  var a = poseAnchor(lm); if (a.ok) refineTarget = a; // 同じ選手を追い続ける
+                }
+              }
               dense.push({ t: el.video.currentTime, landmarks: lm, worldLandmarks: wlm });
             }catch(e){ /* このコマの検出失敗は飛ばす(ループは止めない) */ }
           }
@@ -1252,6 +1370,8 @@ function resetApp(){
   state.mode = "idle";
   state.samples = []; state.duration = 0; state.recording = false;
   state.smoothLive = null; state.refining = false;
+  state.target = null; state.selectedIdx = -1; state.liveAllLandmarks = null;
+  if (el.selectPrompt) el.selectPrompt.hidden = true;
 }
 
 /* ==== 骨格オーバーレイ描画 ==== */
@@ -1317,21 +1437,14 @@ function smoothLiveLandmarks(lm){
   return prev;
 }
 
-function drawOverlay(){
-  var w = el.canvas.clientWidth, h = el.canvas.clientHeight;
-  ctx.clearRect(0, 0, w, h);
-  var lm = null;
-  if (state.mode === "live"){
-    lm = smoothLiveLandmarks(state.liveLandmarks);
-  } else if (state.mode === "playback" && state.samples.length){
-    lm = sampleLandmarksAt(el.video.currentTime);
-  }
+// 1人分の骨格を描く。primary=解析対象の選手(赤・関節点あり)、それ以外(false)=薄いグレーの線のみ。
+function drawSkeleton(lm, primary){
   if (!lm) return;
-
+  var w = el.canvas.clientWidth, h = el.canvas.clientHeight;
   ctx.lineJoin = "round";
   ctx.lineCap = "round"; // 関節の折れ目・線端を丸くして骨格を滑らかに見せる
-  ctx.strokeStyle = "#c5303a";
-  ctx.lineWidth = 3;
+  ctx.strokeStyle = primary ? "#c5303a" : "rgba(147,160,181,.55)";
+  ctx.lineWidth = primary ? 3 : 2;
   CONNECTIONS.forEach(function(pair){
     var a = lm[pair[0]], b = lm[pair[1]];
     if (!visOK(a) || !visOK(b)) return;
@@ -1340,6 +1453,7 @@ function drawOverlay(){
     ctx.lineTo(b.x * w, b.y * h);
     ctx.stroke();
   });
+  if (!primary) return; // 選手以外は線だけ(関節点は描かず、対象を目立たせる)
   ctx.fillStyle = "#fbfbf7";
   ctx.strokeStyle = "rgba(197,48,58,.9)";
   ctx.lineWidth = 1.5;
@@ -1353,6 +1467,26 @@ function drawOverlay(){
     ctx.fill();
     ctx.stroke();
   });
+}
+
+function drawOverlay(){
+  var w = el.canvas.clientWidth, h = el.canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  if (state.mode === "live"){
+    var all = state.liveAllLandmarks || [];
+    var sel = state.selectedIdx;
+    for (var i = 0; i < all.length; i++){
+      if (i === sel) continue;      // 選択選手は最後に手前へ描く
+      drawSkeleton(all[i], false);  // その他の人は薄いグレー
+    }
+    if (sel >= 0 && all[sel]){
+      var s = smoothLiveLandmarks(all[sel]); // 選択選手だけ平滑化して滑らかに
+      drawSkeleton(s || all[sel], true);
+    }
+  } else if (state.mode === "playback" && state.samples.length){
+    var lm = sampleLandmarksAt(el.video.currentTime);
+    if (lm) drawSkeleton(lm, true);
+  }
 }
 </script>
 <script>
